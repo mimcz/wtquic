@@ -88,22 +88,44 @@ allocation-free qualification query in the session's serialized domain. Both
 outputs are required and initialized to zero/UNSUPPORTED on failure. The
 unreleased query now certifies bounded admission as well as accounted input.
 Both legacy and accounted-only constructors/layouts remain compatible and
-unqualified. The additive private `wtq_api_session_create_admission` registration
-certifies fixed effective MsQuic peer limits of eight uni/seven bidi streams;
-other settings and Network.framework return UNSUPPORTED. Network stream pause
-remains DELIVERY_ONLY, not flow-controlled. Cached qualification facts survive
+unqualified. The private `wtq_api_session_create_admission` registration and
+its fixed eight uni/seven bidi layout remain exported unchanged for old
+backends. The MsQuic backend now registers through the additive private
+`wtq_api_session_create_admission_v2`, which certifies every accepted stream
+plan; Network.framework returns UNSUPPORTED. Network stream pause remains
+DELIVERY_ONLY, not flow-controlled. Cached qualification facts survive
 terminal driver teardown.
 
-The existing sixteen engine entries are partitioned as three peer critical,
-one client CONNECT and twelve WT, or three critical, seven server request
-reservations and six WT. WT counts local/peer and uni/bidi together. Incomplete
-prefixes and unknown uni drains occupy only preallocated native credit records;
-full HTTP request parsers keep their existing storage and semantics. Valid WT
-streams wait for engine and API capacity without pressure rejection. Locals
-reserve capacity before transport open. Delayed native stream-ID credit follows
-retained terminal API handles independently of engine detachment. Peer record
-count is at most fifteen, including sparse implicit opens and terminal leases.
-These are not bounds on all provider/OS memory or on autotuned byte windows.
+The stream plan has three inputs. `wtq_msquic_tuning_t`'s existing
+`peer_unidi_stream_count` (U) and `peer_bidi_stream_count` (B) remain the only
+native grant inputs (defaults 8/7; 3<=U<=1024, 1<=B<=1024, U+B<=1024; invalid
+counts fail `wtq_msquic_env_open` and are never clamped). The appended
+`max_local_streams` (L) on `wtq_msquic_client_cfg_t` and
+`wtq_msquic_listener_cfg_t` bounds combined local WT uni/bidi reservations
+per connection; zero, absent or partially covered selects 16, explicit
+1..1024. The bare initializer symbols keep their old write extents; the tuning
+and environment layouts do not change.
+
+Each connection preallocates, before client ConnectionStart or server
+acceptance: P=U+B resident peer records, each with its own classifier, engine
+position and API position; L local reservations; engine P+L+C entries, API
+P+L handles and native metadata P+L+C+3, where C is 1 on a client (its
+CONNECT) and 0 on a server. Defaults are engine 32/31, API 31/31 and native
+35/34 (client/server). There is no HTTP request or WT subpartition: every peer
+record classifies into its own position, so peer admission never waits for a
+local stream to end, and a local open never waits for a peer stream. A local
+open reserves before any native open; at L it returns WOULD_BLOCK with NULL
+output and no native effect. Pending native starts and retained terminal local
+handles stay charged. Peer native credit is replenished only at safe
+retirement (native shutdown, engine detach, no terminal/FIN/receive/send debt,
+no API reference or callback borrow), never on FIN alone. The fixed stream
+allocation, including admission scratch and library alignment, is checked
+against 64 MiB before network exposure; it excludes base session storage, send
+payload, native MsQuic buffering and allocator overhead, and is not a total
+connection-memory bound. `wtq_session_stream_budget` reports the effective
+capacities, these bytes and occupancy gauges as a sized, non-advancing
+snapshot. Byte flow-control windows are unchanged, and a finite plan cannot
+make progress after an application exhausts the peer's native grants.
 
 `wtq_session_service_stream_admission` runs a bounded admission pass in the
 serialized domain after enclosing bridge/application work returns. Nested calls
@@ -111,8 +133,10 @@ defer; OK does not mean every stream was admitted. Transport callback tails may
 also service only when entry proved no enclosing API/engine/driver/callback
 borrow. Handle release and arbitrary API/driver exits never publish waiters.
 Ready WT prefixes join one fixed-record FIFO across both directions; recycled
-pool slots cannot bypass older ready streams. Each pass snapshots at most
-fifteen generations, so new callback-created work waits for a later pass.
+pool slots cannot bypass older ready streams. Each pass snapshots at most one
+generation per peer record (U+B), so new callback-created work waits for a
+later pass. A peer stream waits only for publication outside an enclosing
+callback, never for storage.
 A native resume failure retains its published stream's retry obligation and
 returns BACKEND to an explicit caller. Automatic roots retain the same work for
 later safe service, without repeated opened callbacks or an immediate retry

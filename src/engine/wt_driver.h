@@ -30,6 +30,7 @@
 
 #include "../proto/h3_settings.h"
 #include "../proto/preamble.h"
+#include "stream_budget.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -66,6 +67,30 @@ typedef struct wtq_peer_admission {
     wtq_dstream_t *ds;
     wtq_estream_t *es;
 } wtq_peer_admission_t;
+
+/* Sized successor, not an in-place widening of the exported v1 record.
+ * prefix.reservation is unused in v2; the full-width index below owns it. */
+typedef struct wtq_peer_admission_v2 {
+    uint32_t struct_size;
+    uint32_t reservation;
+    wtq_peer_admission_t prefix;
+} wtq_peer_admission_v2_t;
+
+WTQ_SPI wtq_result_t wtq_conn_peer_admission_init_v2(wtq_conn_t *conn,
+    wtq_peer_admission_v2_t *peer, wtq_dstream_t *ds, uint64_t id,
+    bool bidi, uint32_t reservation);
+WTQ_SPI wtq_result_t wtq_conn_peer_admission_bytes_v2(wtq_conn_t *conn,
+    wtq_peer_admission_v2_t *peer, const uint8_t *data, size_t len,
+    bool fin, uint64_t now_us, size_t *consumed);
+WTQ_SPI void wtq_conn_peer_admission_forget_v2(wtq_conn_t *conn,
+    wtq_peer_admission_v2_t *peer);
+WTQ_SPI uint32_t wtq_conn_stream_index_v2(const wtq_conn_t *conn,
+    const wtq_estream_t *es);
+WTQ_SPI void wtq_conn_stream_retire_v2(wtq_conn_t *conn, uint32_t index,
+    const wtq_dstream_t *ds);
+bool wtq_conn_stream_available_v2(const wtq_conn_t *conn, uint32_t index);
+void wtq_conn_stream_budget_v2(const wtq_conn_t *conn, wtq_stream_budget_t *out);
+bool wtq_conn_stream_storage_v2(uint32_t engine, uint32_t peers, size_t *bytes);
 
 void wtq_conn_enable_admission(wtq_conn_t *conn);
 WTQ_SPI wtq_result_t wtq_conn_peer_admission_init(wtq_conn_t *conn,
@@ -431,6 +456,9 @@ typedef struct wtq_conn_cfg {
 wtq_result_t wtq_conn_create(const wtq_conn_cfg_t *cfg, wtq_driver_t *drv,
                              const wtq_driver_ops_t *ops,
                              wtq_conn_t **out);
+wtq_result_t wtq_conn_create_budget_v2(const wtq_conn_cfg_t *cfg,
+    wtq_driver_t *drv, const wtq_driver_ops_t *ops,
+    const wtq_stream_plan_v1_t *plan, wtq_conn_t **out);
 void wtq_conn_destroy(wtq_conn_t *conn);
 
 /*

@@ -8,6 +8,14 @@
 
 int main(void)
 {
+    _Static_assert(sizeof(wtq_stream_budget_t) == WTQ_STREAM_BUDGET_V1_SIZE,
+        "complete frozen stream-budget v1");
+    wtq_stream_budget_t budget = WTQ_STREAM_BUDGET_INIT;
+    wtq_result_t (*budget_query)(const wtq_session_t *, wtq_stream_budget_t *) =
+        &wtq_session_stream_budget;
+    if (budget.struct_size != WTQ_STREAM_BUDGET_V1_SIZE ||
+        budget.api_capacity != 0 || budget.admission_resume_failures != 0 ||
+        budget_query(NULL, &budget) != WTQ_ERR_INVALID_ARG) return 1;
     if (wtq_session_local_flush(NULL) != WTQ_ERR_INVALID_ARG ||
         wtq_session_local_flush_mode(NULL) != WTQ_LOCAL_FLUSH_UNSUPPORTED)
         return 1;

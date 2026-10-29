@@ -202,12 +202,52 @@ typedef struct wtq_msquic_listener_cfg_v4 {
     wtq_webtransport_profile_set_t webtransport_profiles;
 } wtq_msquic_listener_cfg_v4_t;
 
+/* Complete layouts immediately before stream-budget configuration. */
+typedef struct wtq_msquic_client_cfg_v2 {
+    uint32_t struct_size;
+    const char *server_name;
+    uint16_t port;
+    bool insecure_skip_verify;
+    const wtq_connect_config_t *connect;
+    const wtq_session_events_t *events;
+    void *user;
+    wtq_guard_t guard;
+    wtq_msquic_transport_quiesced_fn on_transport_quiesced;
+} wtq_msquic_client_cfg_v2_t;
+
+typedef struct wtq_msquic_listener_cfg_v5 {
+    uint32_t struct_size;
+    const char *bind_address;
+    uint16_t port;
+    const char *cert_file;
+    const char *key_file;
+    const wtq_serve_config_t *paths;
+    size_t path_count;
+    const wtq_session_events_t *events;
+    void *user;
+    wtq_msquic_accept_prepare_fn accept_prepare;
+    wtq_msquic_accept_abandon_fn accept_abandon;
+    wtq_msquic_transport_quiesced_fn on_transport_quiesced;
+    uint32_t webtransport_profile;
+    wtq_webtransport_profile_set_t webtransport_profiles;
+    size_t path_stride;
+} wtq_msquic_listener_cfg_v5_t;
+
+_Static_assert(offsetof(wtq_msquic_client_cfg_t, max_local_streams) >=
+    sizeof(wtq_msquic_client_cfg_v2_t), "client budget overlaps old padding");
+_Static_assert(offsetof(wtq_msquic_listener_cfg_t, max_local_streams) >=
+    sizeof(wtq_msquic_listener_cfg_v5_t), "listener budget overlaps old padding");
+
 /* Pin a field to the offset a FROZEN layout shadow records for it. Used for
  * every frozen generation, so the diagnostic names the field and both types
  * rather than one particular version. */
 #define WTQ_MSQ_FROZEN_OFF(cur, frozen, f)                                   \
     _Static_assert(offsetof(cur, f) == offsetof(frozen, f),                 \
                    "field " #f " moved from its frozen offset in " #frozen)
+
+WTQ_MSQ_FROZEN_OFF(wtq_msquic_client_cfg_t, wtq_msquic_client_cfg_v2_t, guard);
+WTQ_MSQ_FROZEN_OFF(wtq_msquic_client_cfg_t, wtq_msquic_client_cfg_v2_t, on_transport_quiesced);
+WTQ_MSQ_FROZEN_OFF(wtq_msquic_listener_cfg_t, wtq_msquic_listener_cfg_v5_t, path_stride);
 
 WTQ_MSQ_FROZEN_OFF(wtq_msquic_client_cfg_t, wtq_msquic_client_cfg_v1_t,
                    struct_size);
@@ -507,7 +547,8 @@ struct wtq_dstream {
     bool occupied;
     bool credit_held;
     uint64_t generation;
-    wtq_peer_admission_t admission;
+    uint32_t slot;
+    wtq_peer_admission_v2_t admission;
     struct wtq_dstream *admission_next;
     bool admission_resume_pending;
     uint64_t admission_reset_error, admission_stop_error;
@@ -540,6 +581,16 @@ struct wtq_dstream {
                                 engine exactly once on resume */
 };
 
+struct wtq_msq_admission_snapshot {
+    struct wtq_dstream *ds;
+    uint64_t generation;
+};
+
+static inline bool wtq_msq_peer_record(const struct wtq_dstream *ds)
+{
+    return ds->pooled && !ds->is_local;
+}
+
 /* Backend connection context (the driver SPI's wtq_driver_t). */
 struct wtq_driver {
     wtq_alloc_t alloc;
@@ -547,7 +598,12 @@ struct wtq_driver {
     HQUIC conn;
     wtq_session_t *session;  /* backend-held reference; NULL once dropped */
     struct wtq_dstream *streams;
-    struct wtq_dstream peers[15];
+    /* Peer range first, independent WT local range, CONNECT, then criticals. */
+    struct wtq_dstream *peers;
+    struct wtq_msq_admission_snapshot *admission_snapshot;
+    wtq_stream_plan_v1_t stream_plan;
+    wtq_stream_budget_t budget;
+    uint32_t max_local_streams;
     struct wtq_dstream *admission_head, *admission_tail;
     uint64_t peer_generation;
     bool bounded_admission;
@@ -745,6 +801,7 @@ struct wtq_msquic_listener {
      * Authoritative; selection from the peer's settings happens per
      * connection in the engine. */
     wtq_h3_wt_profile_set_t webtransport_profiles;
+    wtq_stream_plan_v1_t stream_plan;
     size_t path_count;
     struct {
         char path[WTQ_MSQ_PATH_CAP + 1];
@@ -854,6 +911,11 @@ QUIC_STATUS QUIC_API wtq_msq_stream_callback(HQUIC stream, void *ctx,
 struct wtq_dstream *wtq_msq_stream_new(struct wtq_driver *drv,
                                        bool is_local, bool is_bidi,
                                        uint64_t id);
+struct wtq_dstream *wtq_msq_stream_reserve(struct wtq_driver *drv,
+    uint32_t slot, bool local, bool bidi, uint64_t id);
+void wtq_msq_stream_unreserve(struct wtq_driver *drv, struct wtq_dstream *ds);
+wtq_result_t wtq_msq_stream_plan(const wtq_msquic_tuning_t *tuning,
+    uint32_t local, bool client, wtq_stream_plan_v1_t *out);
 wtq_result_t wtq_msq_session_create_bounded(struct wtq_driver *drv,
     const wtq_api_session_cfg_t *cfg, const wtq_msquic_tuning_t *tuning,
     wtq_session_t **out);

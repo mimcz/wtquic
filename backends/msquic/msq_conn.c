@@ -67,6 +67,10 @@ void wtq_msq_conn_free(struct wtq_driver *drv)
     }
     if (drv->conn != NULL)
         drv->api->ConnectionClose(drv->conn);
+    if (drv->admission_snapshot)
+        alloc.free(drv->admission_snapshot, drv->stream_plan.scratch_bytes, alloc.ctx);
+    if (drv->peers)
+        alloc.free(drv->peers, drv->stream_plan.native_bytes, alloc.ctx);
     alloc.free(drv, sizeof(*drv), alloc.ctx);
 }
 
@@ -190,7 +194,7 @@ void wtq_msq_conn_leave_and_poll(struct wtq_driver *drv)
 static void open_unwind(struct wtq_driver *drv, struct wtq_dstream *ds)
 {
     drv->streams = ds->next;
-    drv->alloc.free(ds, sizeof(*ds), drv->alloc.ctx);
+    wtq_msq_stream_unreserve(drv, ds);
 }
 
 static wtq_result_t op_open(struct wtq_driver *drv, wtq_estream_t *ectx,
@@ -202,11 +206,20 @@ static wtq_result_t op_open(struct wtq_driver *drv, wtq_estream_t *ectx,
 
     uint64_t type = (drv->is_client ? 0u : 1u) | (bidi ? 0u : 2u);
     uint64_t count = bidi ? drv->local_bidi_count : drv->local_uni_count;
-    struct wtq_dstream *ds =
-        wtq_msq_stream_new(drv, true, bidi, type + (count << 2));
+    if (count > (UINT64_C(0x3fffffffffffffff) - type) / 4)
+        return WTQ_ERR_STREAM_LIMIT;
+    struct wtq_dstream *ds;
+    if (drv->bounded_admission) {
+        uint32_t index = wtq_conn_stream_index_v2(wtq_api_session_conn(drv->session), ectx);
+        if (!ectx && !bidi) {
+            for (index = drv->budget.engine_capacity; index < drv->budget.native_capacity; ++index)
+                if (!drv->peers[index].occupied) break;
+        }
+        ds = wtq_msq_stream_reserve(drv, index, true, bidi, type + (count << 2));
+    } else ds = wtq_msq_stream_new(drv, true, bidi, type + (count << 2));
 
     if (ds == NULL)
-        return WTQ_ERR_NOMEM;
+        return drv->bounded_admission ? WTQ_ERR_WOULD_BLOCK : WTQ_ERR_NOMEM;
     ds->ectx = ectx;
     ds->ectx_generation = wtq_estream_generation_v1(ectx);
     /* Only the engine's control/QPACK opens have no estream at birth. */
@@ -930,8 +943,8 @@ static QUIC_STATUS conn_dispatch(HQUIC conn, struct wtq_driver *drv,
         wtq_result_t rc;
         if (drv->bounded_admission) {
             ev->PEER_STREAM_STARTED.Flags |= QUIC_STREAM_OPEN_FLAG_DELAY_ID_FC_UPDATES;
-            rc = wtq_conn_peer_admission_init(ec, &ds->admission, ds, id,
-                bidi, (unsigned)(ds - drv->peers));
+            rc = wtq_conn_peer_admission_init_v2(ec, &ds->admission, ds, id,
+                bidi, ds->slot);
         } else {
             rc = bidi ? wtq_conn_on_peer_bidi_opened(ec, ds, id, &es)
                       : wtq_conn_on_peer_uni_opened(ec, ds, id, &es);

@@ -77,25 +77,22 @@ typedef struct wtq_msquic_listener wtq_msquic_listener_t;
  * WTQ_MSQUIC_TUNING_INIT / wtq_msquic_tuning_init; a tuning left with
  * struct_size == 0 is treated as "use defaults".
  *
- * STREAM CREDITS AND THE ENGINE POOL
- *   wtquic's protocol engine holds streams in a FIXED, allocation-free
- *   pool of 16 slots per connection, SHARED by HTTP/3's three critical
- *   unidirectional streams, the CONNECT stream, WebTransport streams the
- *   peer opens, and WebTransport streams this application opens locally.
+ * STREAM CREDITS AND BACKING
+ *   U=peer_unidi_stream_count and B=peer_bidi_stream_count are the sole native
+ *   grant inputs. Defaults remain U=8, B=7. Require 3<=U<=1024, 1<=B<=1024,
+ *   U+B<=1024. Explicit zero counts with nonzero tuning.struct_size are
+ *   invalid, not defaults. Invalid tuning fails environment creation before
+ *   provider exposure; counts are never clamped.
  *
- *   The default credits (8 unidirectional + 7 bidirectional = 15,
- *   leaving one slot for a client's local CONNECT stream) bound the
- *   streams the TRANSPORT will let the peer open. They do not reserve
- *   those slots: streams opened locally consume the same pool, so a
- *   peer stream can still find the pool full even within its credit.
- *
- *   RAISING THESE COUNTS DOES NOT ENLARGE THE ENGINE OR API POOLS. A
- *   stream that arrives with no slot free is rejected explicitly on the
- *   wire (STOP_SENDING, plus RESET_STREAM for a bidirectional stream) —
- *   never accepted, never delivered, never silently discarded. A local
- *   open with no slot free fails with WTQ_ERR_STREAM_LIMIT. Grant larger
- *   credits only if your application genuinely prefers that rejection to
- *   transport-level backpressure.
+ *   Each connection preallocates backing for P=U+B peer reservations and
+ *   independently L=max_local_streams local WT reservations (default 16).
+ *   Engine capacity is P+L+C, API capacity P+L, native metadata P+L+C+3,
+ *   where C=1 for clients and 0 for servers. Defaults are engine 32/31,
+ *   API 31, native 35/34 (client/server). No receive-path growth or hidden
+ *   HTTP/WT subpartition. The checked aggregate fixed-capacity allocation
+ *   is limited to 64 MiB; query actual counts/bytes with stream_budget.
+ *   These resident bounds do not change byte flow-control windows or
+ *   promise progress after an application exhausts the peer's native grants.
  */
 typedef struct wtq_msquic_tuning {
     uint32_t struct_size;
@@ -103,13 +100,9 @@ typedef struct wtq_msquic_tuning {
     /* Let MsQuic buffer send data internally (a copy). Off by default so
      * send buffers are borrowed until acknowledged — true zero copy. */
     bool     send_buffering;
-    /* Unidirectional streams the peer may open toward us: three for
-     * HTTP/3's critical streams plus five application streams. Bounded
-     * by the engine's fixed pool — see above. */
+    /* Native peer uni grant, including three HTTP critical streams. */
     uint16_t peer_unidi_stream_count;
-    /* Bidirectional streams the peer may open toward us (the CONNECT
-     * stream on a server, plus application streams). Bounded by the
-     * engine's fixed pool — see above. */
+    /* Native peer bidi grant, including CONNECT on a server. */
     uint16_t peer_bidi_stream_count;
     /* Per-stream receive window in bytes. Media-scale by default. */
     uint32_t stream_recv_window;
@@ -346,11 +339,17 @@ typedef struct wtq_msquic_listener_cfg {
      * versioned array and, when path_count is greater than one, must cover
      * every element's declared struct_size. */
     size_t path_stride;
+    /* v6: combined local WT uni/bidi resident reservations per child.
+     * Zero, absent or partial selects 16; explicit 1..1024 accepted. Includes
+     * pending starts and retained terminal handles. Copied at listener start,
+     * never overridden per accept. Invalid/over-64-MiB plans fail before
+     * exposure; every child allocates its full backing before acceptance. */
+    uint32_t max_local_streams;
 } wtq_msquic_listener_cfg_t;
 
 #define WTQ_MSQUIC_LISTENER_CFG_INIT                              \
     { (uint32_t)sizeof(wtq_msquic_listener_cfg_t), NULL, 0, NULL, \
-      NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL, 0, 0, 0 }
+      NULL, NULL, 0, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, 0 }
 
 /*
  * Initialise a listener config. Same ABI rule as the client (see above):
@@ -426,11 +425,16 @@ typedef struct wtq_msquic_client_cfg {
      * race. NULL/absent ⇒ today's behavior. */
     wtq_guard_t guard;
     wtq_msquic_transport_quiesced_fn on_transport_quiesced;
+    /* v3: combined local WT uni/bidi resident reservations. Zero, absent or
+     * partial selects 16; explicit 1..1024 accepted. Includes pending starts
+     * and retained terminal handles. Invalid/over-64-MiB plans fail before
+     * exposure; full backing is allocated before ConnectionStart. */
+    uint32_t max_local_streams;
 } wtq_msquic_client_cfg_t;
 
 #define WTQ_MSQUIC_CLIENT_CFG_INIT                                 \
     { (uint32_t)sizeof(wtq_msquic_client_cfg_t), NULL, 0, false,   \
-      NULL, NULL, NULL, { NULL, NULL, NULL }, NULL }
+      NULL, NULL, NULL, { NULL, NULL, NULL }, NULL, 0 }
 
 /*
  * Initialise a client config. Two entry points, one ABI rule:

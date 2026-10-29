@@ -160,6 +160,26 @@ typedef struct wtq_api_admission_ops {
 WTQ_SPI wtq_result_t wtq_api_session_create_admission(
     const wtq_api_session_cfg_t *cfg, const wtq_api_admission_ops_t *ops,
     wtq_session_t **out);
+
+/* Versioned backing registration. native_budget is serialized, read-only to
+ * the core and alive until admission_detach. Queries never call the provider.
+ * The old registration/table and peer record layouts remain frozen. */
+typedef struct wtq_api_admission_v2 {
+    uint32_t struct_size;
+    const wtq_stream_plan_v1_t *plan;
+    wtq_result_t (*service)(wtq_driver_t *drv);
+    void (*lease)(wtq_driver_t *drv, wtq_dstream_t *ds, bool held);
+    const wtq_stream_budget_t *native_budget;
+} wtq_api_admission_v2_t;
+
+WTQ_SPI wtq_result_t wtq_api_stream_plan_v1(uint32_t uni, uint32_t bidi,
+    uint32_t local, bool client, size_t native_record_size,
+    size_t scratch_record_size, wtq_stream_plan_v1_t *out);
+WTQ_SPI wtq_result_t wtq_api_session_create_admission_v2(
+    const wtq_api_session_cfg_t *cfg, const wtq_api_admission_v2_t *ops,
+    wtq_session_t **out);
+WTQ_SPI wtq_result_t wtq_api_session_admit_v2(wtq_session_t *session,
+    wtq_peer_admission_v2_t *peer);
 WTQ_SPI bool wtq_api_session_admission_root(const wtq_session_t *session);
 WTQ_SPI wtq_result_t wtq_api_session_admit(wtq_session_t *session,
     wtq_peer_admission_t *peer);

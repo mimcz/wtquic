@@ -1,4 +1,5 @@
 /* Slot reuse during callbacks, with no transport or exported test hooks. */
+#include <stddef.h>
 #include <stdlib.h>
 #include "../../src/engine/conn.c"
 #include "test_support.h"
@@ -14,6 +15,37 @@ static void detached(wtq_driver_t *drv, wtq_dstream_t *ds, wtq_estream_t *es)
 {
     (void)drv; (void)ds; (void)es;
 }
+
+/* The rows never reach the transport: every other operation refuses. */
+static wtq_result_t no_open(wtq_driver_t *drv, wtq_estream_t *ectx,
+                            wtq_dstream_t **out, uint64_t *id_out)
+{
+    (void)drv; (void)ectx; (void)out; (void)id_out;
+    return WTQ_ERR_STATE;
+}
+static wtq_result_t no_send(wtq_driver_t *drv, wtq_dstream_t *ds,
+                            const uint8_t *data, size_t len, bool fin)
+{
+    (void)drv; (void)ds; (void)data; (void)len; (void)fin;
+    return WTQ_ERR_STATE;
+}
+static wtq_result_t no_shutdown(wtq_driver_t *drv, wtq_dstream_t *ds,
+                                const wtq_shutdown_t *req)
+{
+    (void)drv; (void)ds; (void)req;
+    return WTQ_ERR_STATE;
+}
+static wtq_result_t no_close(wtq_driver_t *drv, uint64_t h3_err)
+{
+    (void)drv; (void)h3_err;
+    return WTQ_ERR_STATE;
+}
+static const wtq_driver_ops_t row_ops = {
+    .open_uni = no_open, .open_bidi = no_open, .send = no_send,
+    .shutdown_stream = no_shutdown, .conn_close = no_close, .detach = detached,
+};
+/* Opaque driver identity: only handed back to row_ops, never dereferenced. */
+static max_align_t row_driver;
 
 static void recycle(wtq_conn_t *conn, wtq_estream_t *es,
                     const uint8_t *p, size_t n, bool fin, void *ctx)
@@ -39,18 +71,22 @@ static int row(size_t n)
 {
     int failures = 0;
     struct reuse_probe probe = { 0 };
-    wtq_conn_t *conn = calloc(1, sizeof(*conn));
+    /* A legacy (unbudgeted) connection, created and sized by the engine. */
+    wtq_conn_cfg_t cfg = {
+        .alloc = wtq_alloc_default(),
+        .perspective = WTQ_PERSPECTIVE_CLIENT,
+        .callbacks = { .on_wt_stream_data = recycle, .ctx = &probe },
+    };
+    wtq_conn_t *conn = NULL;
+    WTQ_TEST_CHECK_EQ_INT(wtq_conn_create(&cfg,
+        (wtq_driver_t *)(void *)&row_driver, &row_ops, &conn), WTQ_OK);
     uint8_t *data = calloc(1, n);
     WTQ_TEST_CHECK(conn != NULL && data != NULL);
     if (conn == NULL || data == NULL) {
-        free(conn); free(data); return failures;
+        wtq_conn_destroy(conn); free(data); return failures;
     }
-    conn->persp = WTQ_PERSPECTIVE_CLIENT;
     conn->session_established = true;
     conn->sess_state = SS_ESTABLISHED;
-    conn->ops.detach = detached;
-    conn->cb.on_wt_stream_data = recycle;
-    conn->cb.ctx = &probe;
     wtq_estream_t *es = NULL;
     WTQ_TEST_CHECK_EQ_INT(wtq_conn_on_peer_uni_opened(conn,
         (wtq_dstream_t *)(void *)conn, 7, &es), WTQ_OK);
@@ -73,7 +109,7 @@ static int row(size_t n)
         data, n, true, 0, &consumed), WTQ_ERR_CLOSED);
     WTQ_TEST_CHECK_EQ_SIZE(consumed, 0);
     WTQ_TEST_CHECK_EQ_INT(probe.calls, 1);
-    free(data); free(conn);
+    free(data); wtq_conn_destroy(conn);
     return failures;
 }
 

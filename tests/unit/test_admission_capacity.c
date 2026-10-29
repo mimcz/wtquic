@@ -7,22 +7,37 @@
 static size_t occupied(const wtq_conn_t *conn)
 {
     size_t count = 0;
-    for (size_t i = 0; i < WTQ_CONN_MAX_PEER_UNI; ++i)
+    for (size_t i = 0; i < conn->stream_capacity; ++i)
         count += conn->peer[i].kind != ES_FREE;
     return count;
+}
+
+/* A legacy (unbudgeted) connection over the fake driver, created and sized by
+ * the engine itself. The caller owns drv, keeps it alive while conn exists,
+ * and releases conn with wtq_conn_destroy. */
+static wtq_conn_t *legacy_conn(struct wtq_driver *drv, wtq_perspective_t role,
+                               int *fp)
+{
+    int failures = 0;
+    wtq_conn_cfg_t cfg = { .alloc = wtq_alloc_default(), .perspective = role };
+    wtq_conn_t *conn = NULL;
+    WTQ_TEST_CHECK_EQ_INT(wtq_conn_create(&cfg, drv, fake_driver_ops(), &conn),
+                          WTQ_OK);
+    if (conn != NULL)
+        WTQ_TEST_CHECK_EQ_SIZE(conn->stream_capacity, WTQ_CONN_LEGACY_STREAMS);
+    *fp += failures;
+    return conn;
 }
 
 static int prefix_reserve(void)
 {
     int failures = 0;
     struct wtq_driver *drv = calloc(1, sizeof(*drv));
-    wtq_conn_t *conn = calloc(1, sizeof(*conn));
-    WTQ_TEST_CHECK(drv != NULL && conn != NULL);
-    if (!drv || !conn) { free(drv); free(conn); return failures; }
+    WTQ_TEST_CHECK(drv != NULL);
+    if (!drv) return failures;
     fake_driver_init(drv, true);
-    conn->drv = drv;
-    conn->ops = *fake_driver_ops();
-    conn->persp = WTQ_PERSPECTIVE_CLIENT;
+    wtq_conn_t *conn = legacy_conn(drv, WTQ_PERSPECTIVE_CLIENT, &failures);
+    if (!conn) { free(drv); return failures; }
     conn->session_established = true;
     conn->sess_state = SS_ESTABLISHED;
     wtq_conn_enable_admission(conn);
@@ -62,7 +77,7 @@ static int prefix_reserve(void)
         }
     }
     WTQ_TEST_CHECK(!conn->closed);
-    free(conn); free(drv);
+    wtq_conn_destroy(conn); free(drv);
     return failures;
 }
 
@@ -70,12 +85,10 @@ static int unknown_and_fin(wtq_perspective_t role)
 {
     int failures = 0;
     struct wtq_driver *drv = calloc(1, sizeof(*drv));
-    wtq_conn_t *conn = calloc(1, sizeof(*conn));
-    if (!drv || !conn) { free(drv); free(conn); return 1; }
+    if (!drv) return 1;
     fake_driver_init(drv, role == WTQ_PERSPECTIVE_CLIENT);
-    conn->drv = drv;
-    conn->ops = *fake_driver_ops();
-    conn->persp = role;
+    wtq_conn_t *conn = legacy_conn(drv, role, &failures);
+    if (!conn) { free(drv); return failures + 1; }
     conn->session_established = true;
     conn->sess_state = SS_ESTABLISHED;
     wtq_conn_enable_admission(conn);
@@ -109,14 +122,14 @@ static int unknown_and_fin(wtq_perspective_t role)
     WTQ_TEST_CHECK_EQ_INT(wtq_conn_peer_admission_bytes(conn, &duplicate,
         &duplicate_type, 1, false, 0, &duplicate_used), WTQ_ERR_PROTO);
     WTQ_TEST_CHECK_EQ_U64(conn->close_code, WTQ_H3_STREAM_CREATION_ERROR);
-    free(conn); free(drv);
+    wtq_conn_destroy(conn); free(drv);
 
     for (unsigned row = 0; row < 4; ++row) {
         drv = calloc(1, sizeof(*drv));
-        conn = calloc(1, sizeof(*conn));
-        if (!drv || !conn) { free(drv); free(conn); return failures + 1; }
+        if (!drv) return failures + 1;
         fake_driver_init(drv, role == WTQ_PERSPECTIVE_CLIENT);
-        conn->drv = drv; conn->ops = *fake_driver_ops(); conn->persp = role;
+        conn = legacy_conn(drv, role, &failures);
+        if (!conn) { free(drv); return failures + 1; }
         wtq_conn_enable_admission(conn);
         bool bidi = row == 1 || row == 2;
         wtq_peer_admission_t p;
@@ -135,7 +148,7 @@ static int unknown_and_fin(wtq_perspective_t role)
         else if (row == 3) WTQ_TEST_CHECK_EQ_U64(conn->close_code,
             role == WTQ_PERSPECTIVE_SERVER ? WTQ_H3_STREAM_CREATION_ERROR : WTQ_H3_ID_ERROR);
         else WTQ_TEST_CHECK(!conn->closed);
-        free(conn); free(drv);
+        wtq_conn_destroy(conn); free(drv);
     }
     return failures;
 }
@@ -158,12 +171,11 @@ static int local_reservation(void)
 {
     int failures = 0;
     struct wtq_driver *drv = calloc(1, sizeof(*drv));
-    wtq_conn_t *conn = calloc(1, sizeof(*conn));
-    if (!drv || !conn) { free(drv); free(conn); return 1; }
+    if (!drv) return 1;
     fake_driver_init(drv, true);
-    conn->drv = drv; conn->ops = *fake_driver_ops();
+    wtq_conn_t *conn = legacy_conn(drv, WTQ_PERSPECTIVE_CLIENT, &failures);
+    if (!conn) { free(drv); return failures + 1; }
     conn->ops.open_uni = nested_open;
-    conn->persp = WTQ_PERSPECTIVE_CLIENT;
     conn->sess_state = SS_ESTABLISHED;
     wtq_conn_enable_admission(conn);
     opening_conn = conn; nested_entry = NULL; opening_nested = false;
@@ -171,7 +183,7 @@ static int local_reservation(void)
     WTQ_TEST_CHECK_EQ_INT(wtq_conn_wt_open_uni(conn, &outer), WTQ_OK);
     WTQ_TEST_CHECK(outer && nested_entry && outer != nested_entry);
     WTQ_TEST_CHECK_EQ_SIZE(occupied(conn), 2);
-    free(conn); free(drv);
+    wtq_conn_destroy(conn); free(drv);
     opening_conn = NULL;
     return failures;
 }
@@ -180,11 +192,10 @@ static int every_prefix_split(void)
 {
     int failures = 0;
     struct wtq_driver *drv = calloc(1, sizeof(*drv));
-    wtq_conn_t *conn = calloc(1, sizeof(*conn));
-    if (!drv || !conn) { free(drv); free(conn); return 1; }
+    if (!drv) return 1;
     fake_driver_init(drv, true);
-    conn->drv = drv; conn->ops = *fake_driver_ops();
-    conn->persp = WTQ_PERSPECTIVE_CLIENT;
+    wtq_conn_t *conn = legacy_conn(drv, WTQ_PERSPECTIVE_CLIENT, &failures);
+    if (!conn) { free(drv); return failures + 1; }
     conn->sess_state = SS_ESTABLISHED; conn->session_established = true;
     conn->session_id = UINT64_C(1) << 60;
     wtq_conn_enable_admission(conn);
@@ -205,7 +216,7 @@ static int every_prefix_split(void)
         WTQ_TEST_CHECK_EQ_SIZE(occupied(conn), 0);
         wtq_conn_peer_admission_forget(conn, &p);
     }
-    free(conn); free(drv);
+    wtq_conn_destroy(conn); free(drv);
     return failures;
 }
 

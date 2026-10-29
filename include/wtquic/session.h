@@ -510,12 +510,10 @@ WTQ_API void wtq_session_release(wtq_session_t *session);
  * zero/UNSUPPORTED on failure. NULL arguments return INVALID_ARG. Legacy or
  * unknown or accounted-only providers return UNSUPPORTED even if they pause.
  * OK certifies bounded admission as well as 65535-byte callback quantum,
- * FLOW_CONTROLLED pause and exact bytes/FIN continuation. Initially only
- * MsQuic with fixed effective peer uni/bidi credit 8/7 qualifies. It reserves
- * three critical parsers plus one client CONNECT/twelve WT entries, or seven
- * server requests/six WT entries. Six/twelve count local and peer WT together.
- * Extra valid WT streams wait without resource-pressure rejection. Native
- * peer stream credit remains charged through retained terminal handles.
+ * FLOW_CONTROLLED pause and exact bytes/FIN continuation. MsQuic qualifies
+ * every accepted stream-budget configuration: every permitted resident peer
+ * stream has independent backing, separate from bounded local WT streams.
+ * Native peer stream credit remains charged through retained terminal handles.
  * Network.framework remains unqualified (delivery-only stream pause).
  * No allocation, callbacks or I/O. Facts remain available on a retained terminal
  * session. The quantum is not a total provider-memory bound. */
@@ -530,6 +528,67 @@ WTQ_API wtq_result_t wtq_session_receive_contract(const wtq_session_t *session,
  * retains that obligation; it does not spin or override an application pause.
  * NULL is INVALID_ARG, unqualified providers UNSUPPORTED, terminal CLOSED. */
 WTQ_API wtq_result_t wtq_session_service_stream_admission(wtq_session_t *session);
+
+/* Resident reservation limits, not cumulative stream IDs or native grants.
+ * WT live gauges count engine owners; residency also includes pending starts
+ * and retained terminal handles. HTTP requests include CONNECT (including the
+ * client's local CONNECT). HTTP critical counts only inbound critical owners.
+ * api_retained_terminal counts both initiators. peer_wt_waiting counts
+ * classified, established peer WT streams awaiting engine/API admission,
+ * including publication deferred by an enclosing callback. Application
+ * receive pause is not waiting. Counters saturate at UINT64_MAX. Reserved
+ * fields are always zero. */
+typedef struct wtq_stream_budget {
+    uint32_t struct_size;
+    uint32_t peer_unidi_stream_count;
+    uint32_t peer_bidi_stream_count;
+    uint32_t max_local_streams;
+    uint32_t engine_capacity;
+    uint32_t api_capacity;
+    uint32_t native_capacity;
+    uint32_t reserved0;
+    uint64_t capacity_bytes;
+    uint32_t peer_uni_resident;
+    uint32_t peer_bidi_resident;
+    uint32_t local_resident;
+    uint32_t api_retained_terminal;
+    uint32_t peer_wt_live;
+    uint32_t local_wt_live;
+    uint32_t http_critical_live;
+    uint32_t http_request_live;
+    uint32_t peer_wt_waiting;
+    uint32_t local_high_water;
+    uint32_t peer_high_water;
+    uint32_t reserved1;
+    uint64_t local_open_blocked;
+    uint64_t admission_resume_failures;
+} wtq_stream_budget_t;
+
+/* Frozen complete v1 prefix, through admission_resume_failures. */
+#define WTQ_STREAM_BUDGET_V1_SIZE 104u
+#define WTQ_STREAM_BUDGET_INIT \
+    { (uint32_t)sizeof(wtq_stream_budget_t), 0, 0, 0, 0, 0, 0, 0, \
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+
+/* Serialized, non-advancing snapshot: no allocation, callbacks or I/O.
+ * Caller sets struct_size, at least WTQ_STREAM_BUDGET_V1_SIZE. Copies only
+ * min(caller size, library size), preserving struct_size and unknown tails.
+ * NULL/undersized arguments return INVALID_ARG; an unqualified provider
+ * (including Network.framework) returns UNSUPPORTED. Errors leave every
+ * output byte untouched. Terminal gauges and counters freeze after the initial
+ * engine close processing, before API stream teardown and the session's
+ * terminal callback. Receive-drain engine owners can still count as WT live;
+ * handles made terminal by that API teardown are not yet counted as retained
+ * terminal. This is not a post-quiescence occupancy report. The frozen values
+ * remain queryable on a retained terminal session; later releases do not
+ * update them.
+ *
+ * capacity_bytes is the actual fixed stream-capacity allocation request size,
+ * including library alignment and admission scratch, limited to 64 MiB. It
+ * excludes base session storage, send payload/descriptors, native buffering
+ * and opaque allocator overhead; it is not a total connection-memory bound. */
+WTQ_API wtq_result_t wtq_session_stream_budget(
+    const wtq_session_t *session, wtq_stream_budget_t *out);
 
 /* --- session lifecycle --------------------------------------------------- */
 
@@ -553,8 +612,14 @@ WTQ_API wtq_result_t wtq_session_drain(wtq_session_t *session);
 /*
  * Open a stream on the established session. The returned handle is
  * valid until its on_stream_closed returns (retain with
- * wtq_stream_add_ref). WTQ_ERR_STREAM_LIMIT when stream credit or the
- * handle pool is exhausted; WTQ_ERR_CLOSED after the session ended.
+ * wtq_stream_add_ref). Qualified MsQuic sessions return WTQ_ERR_WOULD_BLOCK
+ * with NULL output and no native open when max_local_streams is exhausted.
+ * Pending starts and retained terminal handles remain charged. After terminal,
+ * send-completion or final handle-release activity, service stream admission
+ * at a safe serialized root, then retry once; do not spin. Native peer credit
+ * can still delay transmission after a successful local open. Unqualified
+ * providers may return WTQ_ERR_STREAM_LIMIT for their own pool/credit limits.
+ * WTQ_ERR_CLOSED after the session ended.
  */
 WTQ_API wtq_result_t wtq_session_open_uni(wtq_session_t *session,
                                           wtq_stream_t **stream_out);

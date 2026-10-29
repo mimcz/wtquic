@@ -206,6 +206,12 @@ wtq_result_t wtq_msquic_env_open(const wtq_msquic_env_cfg_t *cfg_in,
     if (cfg.existing_registration != NULL && cfg.existing_api == NULL)
         return WTQ_ERR_INVALID_ARG;
 
+    if (cfg.tuning.struct_size == 0)
+        wtq_msquic_tuning_init(&cfg.tuning);
+    if (!wtq_stream_counts_valid(cfg.tuning.peer_unidi_stream_count,
+            cfg.tuning.peer_bidi_stream_count, 16))
+        return WTQ_ERR_INVALID_ARG;
+
     alloc = (cfg.alloc != NULL) ? *cfg.alloc : *wtq_alloc_default();
 
     env = alloc.alloc(sizeof(*env), alloc.ctx);
@@ -223,8 +229,6 @@ wtq_result_t wtq_msquic_env_open(const wtq_msquic_env_cfg_t *cfg_in,
         return WTQ_ERR_BACKEND;
     }
     env->tuning = cfg.tuning;
-    if (env->tuning.struct_size == 0)
-        wtq_msquic_tuning_init(&env->tuning);
 
     /* API table: borrow the caller's or open our own. */
     if (cfg.existing_api != NULL) {

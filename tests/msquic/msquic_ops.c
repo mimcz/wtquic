@@ -323,11 +323,8 @@ static int test_writable_arming(void)
 }
 
 
-/* The MsQuic stream credits must not promise more concurrent peer
- * streams than the engine's fixed 16-slot pool can hold. 8 uni + 7 bidi
- * = 15, leaving one slot for the client's local CONNECT stream while
- * the HTTP/3 critical streams (control + 2 QPACK) fit inside the uni
- * budget. Macro, initializer, and QUIC_SETTINGS translation must agree. */
+/* Native grant defaults remain 8 uni + 7 bidi, independently of local
+ * backing. Macro, initializer, and QUIC_SETTINGS translation must agree. */
 static void test_tuning_stream_credits(int *fp)
 {
     int failures = 0;
@@ -654,6 +651,10 @@ static void cap_on_refused(wtq_session_t *s, uint16_t status, void *user)
     cap_record(s);
 }
 
+static bool capture_terminal_budget;
+static wtq_stream_budget_t terminal_budget;
+static wtq_result_t terminal_budget_rc;
+
 static void cap_on_closed(wtq_session_t *s, uint32_t code,
                           const uint8_t *reason, size_t rlen, bool clean,
                           void *user)
@@ -664,6 +665,10 @@ static void cap_on_closed(wtq_session_t *s, uint32_t code,
     (void)clean;
     (void)user;
     cap_record(s);
+    if (capture_terminal_budget) {
+        terminal_budget = (wtq_stream_budget_t)WTQ_STREAM_BUDGET_INIT;
+        terminal_budget_rc = wtq_session_stream_budget(s, &terminal_budget);
+    }
 }
 
 /* Local-stream flow stubs: streams open/start/send successfully so the
@@ -675,12 +680,14 @@ struct sent_rec {
 };
 static struct sent_rec g_sent[32];
 static int g_sent_n;
+static unsigned g_native_opens, g_native_starts;
 
 static QUIC_STATUS QUIC_API rec_stream_open(HQUIC conn,
                                             QUIC_STREAM_OPEN_FLAGS flags,
                                             QUIC_STREAM_CALLBACK_HANDLER cb,
                                             void *ctx, HQUIC *out)
 {
+    ++g_native_opens;
     (void)conn;
     (void)flags;
     (void)cb;
@@ -691,6 +698,7 @@ static QUIC_STATUS QUIC_API rec_stream_open(HQUIC conn,
 static QUIC_STATUS QUIC_API rec_stream_start(HQUIC h,
                                              QUIC_STREAM_START_FLAGS f)
 {
+    ++g_native_starts;
     (void)h;
     (void)f;
     return QUIC_STATUS_SUCCESS;
@@ -1472,6 +1480,7 @@ static int test_recv_reset_while_paused(void)
 static struct rx_cap {
     int established;
     int opened;
+    uint64_t opened_ids[32];
     int data_calls;
     int fin_calls;
     size_t bytes;
@@ -1491,6 +1500,7 @@ static struct rx_cap {
     unsigned closed_calls;
     unsigned commit_calls;
 } g_pr;
+static void (*pr_established_hook)(wtq_session_t *, void *);
 
 static void pr_on_send_committed(wtq_session_t *s, wtq_stream_t *st, void *u)
 {
@@ -1505,6 +1515,7 @@ static void pr_on_established(wtq_session_t *s, wtq_str_t sub, void *u)
     (void)sub;
     (void)u;
     g_pr.established++;
+    if (pr_established_hook) pr_established_hook(s, u);
 }
 
 static struct {
@@ -1542,6 +1553,7 @@ static void pr_on_stream_opened(wtq_session_t *s, wtq_stream_t *st,
     (void)bidi;
     (void)u;
     g_pr.opened++;
+    if (g_pr.opened <= 32) g_pr.opened_ids[g_pr.opened - 1] = wtq_stream_id(st);
     if (admission_borrow.endpoint_depth) admission_borrow.unsafe_publications++;
     g_pr.stream = st;
     if (g_pr.retain_stream)
@@ -1614,9 +1626,10 @@ static uint64_t recv_deliver_bytes(struct wtq_dstream *ds,
 /* Bring a client session to ESTABLISHED over the fake table (mirrors the
  * CONNECT flow the error-record rigs use, answered with a 200), wiring the
  * pause-relevant events. Returns the driver or NULL. */
-static struct wtq_driver *pause_estab_mode(QUIC_API_TABLE *api,
+static struct wtq_driver *pause_estab_plan(QUIC_API_TABLE *api,
                                       wtq_session_t **out_sess,
-                                      const wtq_alloc_t *alloc, bool bounded)
+    const wtq_alloc_t *alloc, bool bounded, const wtq_msquic_tuning_t *configured,
+    uint32_t local)
 {
     ord_api(api);
     api->ConnectionShutdown = rec_conn_shutdown;
@@ -1630,6 +1643,7 @@ static struct wtq_driver *pause_estab_mode(QUIC_API_TABLE *api,
     if (drv == NULL)
         return NULL;
     drv->conn = (HQUIC)(void *)drv;
+    drv->max_local_streams = local;
     g_sent_n = 0;
     g_rse_calls = 0;
     g_rse_fail = 0;
@@ -1649,13 +1663,14 @@ static struct wtq_driver *pause_estab_mode(QUIC_API_TABLE *api,
         .alloc = alloc,
         .perspective = WTQ_PERSPECTIVE_CLIENT,
         .events = &ev,
-        .user = NULL,
+        .user = drv,
         .drv = drv,
         .ops = wtq_msq_driver_ops(),
     };
     wtq_session_t *sess = NULL;
     wtq_msquic_tuning_t tuning;
     wtq_msquic_tuning_init(&tuning);
+    if (configured) tuning = *configured;
     wtq_result_t create_rc = bounded
         ? wtq_msq_session_create_bounded(drv, &scfg, &tuning, &sess)
         : wtq_api_session_create(&scfg, &sess);
@@ -1693,8 +1708,8 @@ static struct wtq_driver *pause_estab_mode(QUIC_API_TABLE *api,
     wtq_estream_t *pes = NULL;
     wtq_api_session_enter(sess);
     if (bounded) {
-        (void)wtq_conn_peer_admission_init(ec, &pds->admission, pds, 3,
-            false, (unsigned)(pds - drv->peers));
+        (void)wtq_conn_peer_admission_init_v2(ec, &pds->admission, pds, 3,
+            false, pds->slot);
         size_t consumed = 0;
         (void)wtq_msq_stream_input(pds, sbuf, 1 + flen, false, &consumed);
     } else {
@@ -1739,6 +1754,12 @@ fail:
     drv->session = NULL;
     wtq_msq_conn_free(drv);
     return NULL;
+}
+
+static struct wtq_driver *pause_estab_mode(QUIC_API_TABLE *api,
+    wtq_session_t **out_sess, const wtq_alloc_t *alloc, bool bounded)
+{
+    return pause_estab_plan(api, out_sess, alloc, bounded, NULL, 0);
 }
 
 static struct wtq_driver *pause_estab(QUIC_API_TABLE *api,
@@ -2204,6 +2225,10 @@ static void lifetime_poll(struct wtq_driver *drv)
 
 static struct {
     size_t live;
+    size_t allocations;
+    size_t free_calls;
+    size_t attempts, fail_at;
+    size_t allocated_bytes, freed_bytes;
     size_t records;
     size_t peak_records;
     size_t allocated_records;
@@ -2223,9 +2248,12 @@ static struct {
 static void *lifetime_alloc(size_t n, void *ctx)
 {
     (void)ctx;
+    if (++lifetime.attempts == lifetime.fail_at) return NULL;
     void *p = malloc(n);
     if (p != NULL) {
         lifetime.live++;
+        lifetime.allocations++;
+        lifetime.allocated_bytes += n;
         if (n == sizeof(struct wtq_dstream)) {
             lifetime.records++;
             lifetime.allocated_records++;
@@ -2239,6 +2267,7 @@ static void *lifetime_alloc(size_t n, void *ctx)
 static void lifetime_free(void *p, size_t n, void *ctx)
 {
     (void)ctx;
+    lifetime.freed_bytes += n;
     if (n == sizeof(struct wtq_dstream)) {
         lifetime.records--;
         lifetime.frees++;
@@ -2246,6 +2275,7 @@ static void lifetime_free(void *p, size_t n, void *ctx)
             lifetime.forbidden_frees++;
     }
     lifetime.live--;
+    lifetime.free_calls++;
     free(p);
 }
 
@@ -2479,6 +2509,349 @@ static void QUIC_API admission_close(HQUIC handle)
     if (handle == admission_credit_handle) admission_credit_closes++;
 }
 
+/* Use each resident record as its fake native handle, so the existing send
+ * completion helper also works for the server's CONNECT response. */
+static struct wtq_dstream *stream_budget_peer(struct wtq_driver *drv,
+    unsigned reservation, uint64_t id, bool bidi, int *fp)
+{
+    int failures = 0;
+    struct wtq_dstream *ds = &drv->peers[reservation];
+    WTQ_TEST_CHECK(!ds->occupied);
+    if (failures) { *fp += failures; return NULL; }
+    QUIC_CONNECTION_EVENT ev = { .Type = QUIC_CONNECTION_EVENT_PEER_STREAM_STARTED };
+    ev.PEER_STREAM_STARTED.Stream = (HQUIC)(void *)ds;
+    ev.PEER_STREAM_STARTED.Flags = bidi ? QUIC_STREAM_OPEN_FLAG_NONE
+        : QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL;
+    g_peer_id = id;
+    g_ord.n = 0;
+    WTQ_TEST_CHECK_EQ_INT(wtq_msq_conn_callback(NULL, drv, &ev), QUIC_STATUS_SUCCESS);
+    WTQ_TEST_CHECK(ev.PEER_STREAM_STARTED.Flags & QUIC_STREAM_OPEN_FLAG_DELAY_ID_FC_UPDATES);
+    WTQ_TEST_CHECK_EQ_INT(g_ord.n, 1);
+    WTQ_TEST_CHECK(g_ord.call[0].is_handler && g_ord.call[0].ctx == ds);
+    WTQ_TEST_CHECK(ds->occupied && ds->pooled && !ds->is_local);
+    WTQ_TEST_CHECK_EQ_INT(ds->is_bidi, bidi);
+    WTQ_TEST_CHECK_EQ_U64(ds->id, id);
+    WTQ_TEST_CHECK_EQ_INT(ds->admission.reservation, reservation);
+    *fp += failures;
+    return failures ? NULL : ds;
+}
+
+/* One receive, one explicit service pass, and at most one native suffix
+ * redelivery. A waiting stream is never force-resumed by the fixture. */
+static size_t stream_budget_deliver(struct wtq_dstream *ds,
+    const uint8_t *wire, size_t len, bool fin, int *fp)
+{
+    int failures = 0;
+    uint64_t used = recv_deliver_bytes(ds, wire, (uint32_t)len, fin);
+    WTQ_TEST_CHECK(used <= len);
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(ds->drv->session), WTQ_OK);
+    if (used < len && ds->ectx && !ds->recv_disabled)
+        used += recv_deliver_bytes(ds, wire + used, (uint32_t)(len - used), fin);
+    WTQ_TEST_CHECK(used <= len);
+    *fp += failures;
+    return (size_t)used;
+}
+
+static int stream_budget_no_shutdowns(void)
+{
+    int failures = 0;
+    for (int i = 0; i < g_ord.n; ++i)
+        WTQ_TEST_CHECK(g_ord.call[i].is_handler);
+    return failures;
+}
+
+/* Native 8-uni/7-bidi credit permits this mixed workload. Long-lived WT
+ * requests must not make video depend on publication/session teardown. */
+static int test_stream_budget_progress(bool with_local)
+{
+    int failures = 0;
+    QUIC_API_TABLE api;
+    wtq_session_t *sess = NULL;
+    wtq_stream_t *held[5] = { 0 };
+    wtq_stream_t *local = NULL, *video_handle = NULL;
+    struct wtq_dstream *owners[5] = { 0 };
+    struct wtq_dstream *local_ds = NULL;
+    struct wtq_dstream *critical[3] = { 0 };
+    memset(&lifetime, 0, sizeof(lifetime));
+    memset(&g_pr, 0, sizeof(g_pr));
+    g_conn_shutdowns = g_term_fired = g_sent_n = g_rse_calls = g_rse_fail = 0;
+    ord_api(&api);
+    api.ConnectionShutdown = rec_conn_shutdown;
+    api.StreamOpen = rec_stream_open;
+    api.StreamStart = rec_stream_start;
+    api.StreamSend = rec_stream_send;
+    api.StreamReceiveSetEnabled = rec_recv_set_enabled;
+    api.StreamClose = lifetime_close;
+    const wtq_alloc_t alloc = { .alloc = lifetime_alloc, .free = lifetime_free };
+    struct wtq_driver *drv = wtq_msq_conn_new(&alloc, &api, false);
+    WTQ_TEST_CHECK(drv != NULL);
+    if (!drv) return failures;
+    drv->conn = (HQUIC)(void *)drv;
+
+    wtq_session_events_t events;
+    wtq_session_events_init(&events);
+    events.on_established = pr_on_established;
+    events.on_stream_opened = pr_on_stream_opened;
+    events.on_stream_data = pr_on_stream_data;
+    events.on_stream_closed = pr_on_stream_closed;
+    events.on_stream_reset = pr_on_stream_reset;
+    events.on_stream_stop = pr_on_stream_stop;
+    events.on_closed = cap_on_closed;
+    const wtq_api_session_cfg_t cfg = {
+        .alloc = &alloc, .perspective = WTQ_PERSPECTIVE_SERVER,
+        .events = &events, .drv = drv, .ops = wtq_msq_driver_ops(),
+    };
+    wtq_msquic_tuning_t tuning;
+    wtq_msquic_tuning_init(&tuning);
+    tuning.peer_unidi_stream_count = 8;
+    tuning.peer_bidi_stream_count = 7;
+    WTQ_TEST_CHECK_EQ_INT(wtq_msq_session_create_bounded(drv, &cfg, &tuning, &sess), WTQ_OK);
+    WTQ_TEST_CHECK(sess != NULL);
+    if (!sess) goto cleanup;
+    drv->session = sess;
+    WTQ_TEST_CHECK(drv->bounded_admission);
+    size_t quantum = 0;
+    wtq_receive_pause_mode_t mode = WTQ_RECEIVE_PAUSE_UNSUPPORTED;
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_receive_contract(sess, &quantum, &mode), WTQ_OK);
+    WTQ_TEST_CHECK_EQ_SIZE(quantum, 65535);
+    WTQ_TEST_CHECK_EQ_INT(mode, WTQ_RECEIVE_PAUSE_FLOW_CONTROLLED);
+    wtq_serve_config_t path;
+    wtq_serve_config_init(&path);
+    path.path = "/app";
+    WTQ_TEST_CHECK_EQ_INT(wtq_api_session_serve(sess, &path, 1), WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(wtq_api_session_start(sess, 0), WTQ_OK);
+    if (failures) goto cleanup;
+
+    uint8_t wire[512] = { 0 };
+    size_t len = 0;
+    const wtq_h3_settings_encode_cfg_t settings = {
+        .enable_connect_protocol = true, .wt_profiles = 0,
+    };
+    WTQ_TEST_CHECK_EQ_INT(wtq_h3_settings_encode_frame(&settings,
+        wire + 1, sizeof(wire) - 1, &len), WTQ_H3_SETTINGS_OK);
+    if (failures) goto cleanup;
+    critical[0] = stream_budget_peer(drv, 0, 2, false, &failures);
+    if (!critical[0]) goto cleanup;
+    WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(critical[0], wire, (uint32_t)(len + 1), false), len + 1);
+    failures += stream_budget_no_shutdowns();
+    for (unsigned i = 1; i < 3 && !failures; ++i) {
+        critical[i] = stream_budget_peer(drv, i, 2 + 4u * i, false, &failures);
+        if (!critical[i]) goto cleanup;
+        const uint8_t type = (uint8_t)(i + 1);
+        WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(critical[i], &type, 1, false), 1);
+        failures += stream_budget_no_shutdowns();
+    }
+    if (failures) goto cleanup;
+    for (unsigned i = 0; i < 3; ++i)
+        WTQ_TEST_CHECK(critical[i]->ectx != NULL && !critical[i]->shutdown_complete);
+    WTQ_TEST_CHECK_EQ_U64(drv->local_uni_count, 3);
+    WTQ_TEST_CHECK_EQ_U64(drv->local_bidi_count, 0);
+    complete_all_sends();
+
+    uint8_t section[256];
+    size_t section_len = 0;
+    WTQ_TEST_CHECK_EQ_INT(wtq_connect_encode_request("example.com", 11,
+        "/app", 4, NULL, 0, NULL, 0, section, sizeof(section), &section_len), WTQ_CONNECT_OK);
+    WTQ_TEST_CHECK_EQ_INT(wtq_h3_frame_encode_header(WTQ_H3_FRAME_HEADERS,
+        section_len, wire, sizeof(wire), &len), 0);
+    if (failures) goto cleanup;
+    memcpy(wire + len, section, section_len);
+    len += section_len;
+    struct wtq_dstream *connect = stream_budget_peer(drv, 8, 0, true, &failures);
+    if (!connect) goto cleanup;
+    WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(connect, wire, (uint32_t)len, false), len);
+    failures += stream_budget_no_shutdowns();
+    complete_all_sends();
+    WTQ_TEST_CHECK_EQ_INT(g_pr.established, 1);
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_status(sess), WTQ_SESSION_STATUS_ESTABLISHED);
+    WTQ_TEST_CHECK(connect->ectx != NULL && !connect->shutdown_complete);
+    WTQ_TEST_CHECK_EQ_SIZE(stream_record_count(drv), 7);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.records, 0);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.live, 5); /* driver, native, scratch, API, engine */
+    wtq_stream_budget_t budget = WTQ_STREAM_BUDGET_INIT;
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(sess, &budget), WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(budget.peer_unidi_stream_count, 8);
+    WTQ_TEST_CHECK_EQ_INT(budget.peer_bidi_stream_count, 7);
+    WTQ_TEST_CHECK_EQ_INT(budget.max_local_streams, 16);
+    WTQ_TEST_CHECK_EQ_INT(budget.engine_capacity, 31);
+    WTQ_TEST_CHECK_EQ_INT(budget.api_capacity, 31);
+    WTQ_TEST_CHECK_EQ_INT(budget.native_capacity, 34);
+    WTQ_TEST_CHECK_EQ_INT(budget.peer_uni_resident, 3);
+    WTQ_TEST_CHECK_EQ_INT(budget.peer_bidi_resident, 1);
+    WTQ_TEST_CHECK_EQ_INT(budget.http_critical_live, 3);
+    WTQ_TEST_CHECK_EQ_INT(budget.http_request_live, 1);
+    WTQ_TEST_CHECK_EQ_INT(budget.local_resident, 0);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 0);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.data_calls, 0);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.closed_calls, 0);
+    WTQ_TEST_CHECK_EQ_INT(g_conn_shutdowns, 0);
+    WTQ_TEST_CHECK_EQ_INT(g_term_fired, 0);
+    if (failures) goto cleanup;
+
+    const size_t peer_allocations = lifetime.allocations;
+    const size_t peer_frees = lifetime.free_calls;
+    g_pr.retain_stream = true;
+    for (unsigned i = 0; i < 5 && !failures; ++i) {
+        bool bidi = i < 3;
+        uint64_t id = bidi ? 4u + 4u * i : 14u + 4u * (i - 3);
+        owners[i] = stream_budget_peer(drv, bidi ? 9u + i : i, id, bidi, &failures);
+        if (!owners[i]) goto cleanup;
+        size_t prefix_len = 0;
+        WTQ_TEST_CHECK_EQ_INT(wtq_preamble_encode(bidi ? WTQ_PREAMBLE_KIND_BIDI
+            : WTQ_PREAMBLE_KIND_UNI, 0, wire, sizeof(wire), &prefix_len), WTQ_PREAMBLE_OK);
+        if (failures) goto cleanup;
+        wire[prefix_len] = (uint8_t)('a' + i);
+        WTQ_TEST_CHECK_EQ_SIZE(stream_budget_deliver(owners[i], wire,
+            prefix_len + 1, false, &failures), prefix_len + 1);
+        if (g_pr.opened == (int)i + 1) held[i] = g_pr.stream;
+        WTQ_TEST_CHECK(held[i] != NULL);
+        if (!held[i]) goto cleanup;
+        WTQ_TEST_CHECK_EQ_U64(wtq_stream_id(held[i]), id);
+        WTQ_TEST_CHECK_EQ_INT(wtq_stream_is_bidi(held[i]), bidi);
+        WTQ_TEST_CHECK(!wtq_stream_is_local(held[i]));
+        WTQ_TEST_CHECK(owners[i]->ectx && owners[i]->credit_held);
+        WTQ_TEST_CHECK(wtq_estream_is_wt_data_v1(owners[i]->ectx, owners[i]));
+        WTQ_TEST_CHECK_EQ_INT(g_pr.opened, i + 1);
+        WTQ_TEST_CHECK_EQ_INT(g_pr.data_calls, i + 1);
+        WTQ_TEST_CHECK_EQ_SIZE(g_pr.bytes, i + 1);
+        failures += stream_budget_no_shutdowns();
+    }
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.allocations, peer_allocations);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.free_calls, peer_frees);
+    WTQ_TEST_CHECK_EQ_SIZE(g_pr.buf_len, 5);
+    WTQ_TEST_CHECK(memcmp(g_pr.buf, "abcde", 5) == 0);
+    if (failures) goto cleanup;
+    if (with_local) {
+        WTQ_TEST_CHECK_EQ_INT(wtq_session_open_uni(sess, &local), WTQ_OK);
+        WTQ_TEST_CHECK(local != NULL);
+        if (!local) goto cleanup;
+        wtq_stream_add_ref(local);
+        local_ds = drv->streams;
+        WTQ_TEST_CHECK(local_ds->is_local && !local_ds->is_bidi && local_ds->ectx);
+        WTQ_TEST_CHECK(wtq_estream_is_wt_data_v1(local_ds->ectx, local_ds));
+        WTQ_TEST_CHECK_EQ_U64(wtq_stream_id(local), 15);
+        WTQ_TEST_CHECK(local_ds->credit_held);
+        complete_all_sends();
+    }
+    const size_t local_count = with_local ? 1u : 0u;
+    WTQ_TEST_CHECK_EQ_SIZE(stream_record_count(drv), 12 + local_count);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.records, 0);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.allocated_records, 0);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.live, 5);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 5);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.fin_calls, 0);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.closed_calls, 0);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.terminal_order, 0);
+    WTQ_TEST_CHECK_EQ_INT(lifetime.closes, 0);
+    WTQ_TEST_CHECK_EQ_SIZE(drv->pending_sends, 0);
+    if (failures) goto cleanup;
+
+    /* Three critical uni + small uni + catalog uni + video uni = 6 <= 8;
+     * CONNECT + three WT bidi requests = 4 <= 7. Local WT is independent
+     * of these native peer grants. */
+    const size_t allocations = lifetime.allocations;
+    const size_t frees = lifetime.free_calls;
+    struct wtq_dstream *video = stream_budget_peer(drv, 5, 22, false, &failures);
+    if (!video) goto cleanup;
+    size_t prefix_len = 0;
+    WTQ_TEST_CHECK_EQ_INT(wtq_preamble_encode(WTQ_PREAMBLE_KIND_UNI, 0,
+        wire, sizeof(wire), &prefix_len), WTQ_PREAMBLE_OK);
+    if (failures) goto cleanup;
+    static const uint8_t payload[] = { 'v', 'i', 'd', 'e', 'o', 0, 0xa5, 0xff };
+    memcpy(wire + prefix_len, payload, sizeof(payload));
+    len = prefix_len + sizeof(payload);
+    size_t consumed = stream_budget_deliver(video, wire, len, true, &failures);
+    if (g_pr.opened == 6) video_handle = g_pr.stream;
+    size_t peer_uni = 0, peer_bidi = 0;
+    for (struct wtq_dstream *ds = drv->streams; ds; ds = ds->next) {
+        if (!ds->is_local) {
+            if (ds->is_bidi) peer_bidi++;
+            else peer_uni++;
+        }
+    }
+    WTQ_TEST_CHECK_EQ_SIZE(peer_uni, 6);
+    WTQ_TEST_CHECK_EQ_SIZE(peer_bidi, 4);
+    WTQ_TEST_CHECK(peer_uni <= tuning.peer_unidi_stream_count);
+    WTQ_TEST_CHECK(peer_bidi <= tuning.peer_bidi_stream_count);
+
+    /* The progress oracle is evaluated before any persistent owner closes. */
+    fprintf(stderr, "stream-budget local=%u: setup=ok peer_wt=5 consumed=%zu/%zu "
+        "opened=%d bytes=%zu fin=%d closed=%u\n", with_local ? 1u : 0u,
+        consumed, len, g_pr.opened, g_pr.bytes, g_pr.fin_calls, g_pr.closed_calls);
+    WTQ_TEST_CHECK_EQ_SIZE(consumed, len);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 6);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.data_calls, 6);
+    WTQ_TEST_CHECK_EQ_SIZE(g_pr.bytes, 5 + sizeof(payload));
+    WTQ_TEST_CHECK_EQ_SIZE(g_pr.buf_len, 5 + sizeof(payload));
+    WTQ_TEST_CHECK(memcmp(g_pr.buf + 5, payload, sizeof(payload)) == 0);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.fin_calls, 1);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.closed_calls, 1);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.terminal_order, 0);
+    WTQ_TEST_CHECK_EQ_INT(g_conn_shutdowns, 0);
+    WTQ_TEST_CHECK_EQ_INT(g_term_fired, 0);
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_status(sess), WTQ_SESSION_STATUS_ESTABLISHED);
+    failures += stream_budget_no_shutdowns();
+    WTQ_TEST_CHECK_EQ_SIZE(stream_record_count(drv), 13 + local_count);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.allocations, allocations);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.free_calls, frees);
+    WTQ_TEST_CHECK_EQ_INT(lifetime.closes, 0);
+    for (unsigned i = 0; i < 5; ++i)
+        WTQ_TEST_CHECK(owners[i]->ectx && owners[i]->credit_held &&
+            !owners[i]->shutdown_complete && !owners[i]->recv_held_data && !owners[i]->fin_pending);
+    if (local_ds)
+        WTQ_TEST_CHECK(local_ds->ectx && local_ds->credit_held && !local_ds->shutdown_complete);
+    for (unsigned i = 0; i < 3; ++i)
+        WTQ_TEST_CHECK(critical[i]->ectx && !critical[i]->shutdown_complete);
+    WTQ_TEST_CHECK(connect->ectx && !connect->shutdown_complete);
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(sess, &budget), WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(budget.peer_uni_resident, 6);
+    WTQ_TEST_CHECK_EQ_INT(budget.peer_bidi_resident, 4);
+    WTQ_TEST_CHECK_EQ_INT(budget.local_resident, local_count);
+    WTQ_TEST_CHECK_EQ_INT(budget.peer_wt_live, 5);
+    WTQ_TEST_CHECK_EQ_INT(budget.local_wt_live, local_count);
+    WTQ_TEST_CHECK_EQ_INT(budget.api_retained_terminal, 1);
+    WTQ_TEST_CHECK_EQ_INT(budget.peer_wt_waiting, 0);
+    WTQ_TEST_CHECK_EQ_INT(budget.peer_high_water, 10);
+
+    if (video_handle) {
+        WTQ_TEST_CHECK_EQ_U64(wtq_stream_id(video_handle), 22);
+        WTQ_TEST_CHECK(video->ectx == NULL && video->credit_held);
+        lifetime_shutdown(video);
+        WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(sess), WTQ_OK);
+        WTQ_TEST_CHECK(video->occupied && video->credit_held);
+        WTQ_TEST_CHECK_EQ_INT(lifetime.closes, 0);
+        wtq_stream_release(video_handle);
+        video_handle = NULL;
+        WTQ_TEST_CHECK(video->occupied && !video->credit_held);
+        WTQ_TEST_CHECK_EQ_INT(lifetime.closes, 0);
+        WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(sess), WTQ_OK);
+        WTQ_TEST_CHECK(!video->occupied && video->stream == NULL);
+        WTQ_TEST_CHECK_EQ_INT(lifetime.closes, 1);
+        WTQ_TEST_CHECK_EQ_SIZE(stream_record_count(drv), 12 + local_count);
+        WTQ_TEST_CHECK_EQ_SIZE(lifetime.allocations, allocations);
+        WTQ_TEST_CHECK_EQ_SIZE(lifetime.free_calls, frees);
+        WTQ_TEST_CHECK_EQ_INT(g_pr.fin_calls, 1);
+        WTQ_TEST_CHECK_EQ_INT(g_pr.closed_calls, 1);
+    }
+
+cleanup:
+    complete_all_sends();
+    for (unsigned i = 0; i < 5; ++i) wtq_stream_release(held[i]);
+    wtq_stream_release(local);
+    wtq_stream_release(video_handle);
+    wtq_api_session_admission_detach(sess);
+    wtq_session_release(sess);
+    drv->session = NULL;
+    drv->conn = NULL;
+    wtq_msq_conn_free(drv);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.live, 0);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.records, 0);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.free_calls, lifetime.allocations);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.frees, lifetime.allocated_records);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.forbidden_frees, 0);
+    return failures;
+}
+
 static int test_bounded_admission_borrow_and_credit(void)
 {
     int failures = 0;
@@ -2491,8 +2864,8 @@ static int test_bounded_admission_borrow_and_credit(void)
     wtq_receive_pause_mode_t mode = WTQ_RECEIVE_PAUSE_UNSUPPORTED;
     WTQ_TEST_CHECK_EQ_INT(wtq_session_receive_contract(sess, &quantum, &mode), WTQ_OK);
     WTQ_TEST_CHECK_EQ_SIZE(quantum, 65535);
-    wtq_stream_t *locals[12] = { 0 };
-    for (size_t i = 0; i < 12; ++i) {
+    wtq_stream_t *locals[16] = { 0 };
+    for (size_t i = 0; i < 16; ++i) {
         WTQ_TEST_CHECK_EQ_INT(wtq_session_open_uni(sess, &locals[i]), WTQ_OK);
         wtq_stream_add_ref(locals[i]);
     }
@@ -2507,9 +2880,10 @@ static int test_bounded_admission_borrow_and_credit(void)
     struct wtq_dstream *ds = g_ord.call[0].ctx;
     WTQ_TEST_CHECK(ds != NULL && ds->pooled);
     const uint8_t bytes[] = { 0x40, 0x54, 0, 'a', 'b' };
+    wtq_api_session_enter(sess); /* defer publication under an actual outer borrow */
     WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(ds, bytes, sizeof(bytes), true), 3);
     WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 0);
-    WTQ_TEST_CHECK(ds->admission.es == NULL && ds->recv_held_data);
+    WTQ_TEST_CHECK(ds->admission.prefix.es == NULL && ds->recv_held_data);
     admission_borrow.drv = drv;
     admission_borrow.active = true;
     admission_borrow.endpoint_depth = 1;
@@ -2522,6 +2896,7 @@ static int test_bounded_admission_borrow_and_credit(void)
     WTQ_TEST_CHECK_EQ_INT(admission_borrow.unsafe_publications, 0);
     admission_borrow.endpoint_depth = 0;
     admission_borrow.active = false;
+    WTQ_TEST_CHECK(!wtq_api_session_leave(sess));
     g_pr.retain_stream = true;
     WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(sess), WTQ_OK);
     WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 1);
@@ -2541,7 +2916,7 @@ static int test_bounded_admission_borrow_and_credit(void)
     WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(sess), WTQ_OK);
     WTQ_TEST_CHECK_EQ_INT(admission_credit_closes, 1);
     WTQ_TEST_CHECK(!ds->occupied);
-    for (size_t i = 1; i < 12; ++i) wtq_stream_release(locals[i]);
+    for (size_t i = 1; i < 16; ++i) wtq_stream_release(locals[i]);
     wtq_api_session_admission_detach(sess);
     wtq_session_release(sess);
     drv->session = NULL;
@@ -2560,55 +2935,99 @@ static int test_bounded_handle_debt(void)
     WTQ_TEST_CHECK(drv != NULL);
     if (!drv) return failures;
     wtq_stream_t *held[16] = { 0 };
+    struct wtq_dstream *local_ds[16] = { 0 };
     for (size_t i = 0; i < 16; ++i) {
         WTQ_TEST_CHECK_EQ_INT(wtq_session_open_uni(sess, &held[i]), WTQ_OK);
+        WTQ_TEST_CHECK(held[i] != NULL);
+        if (!held[i]) break;
+        local_ds[i] = drv->streams;
         wtq_stream_add_ref(held[i]);
         WTQ_TEST_CHECK_EQ_INT(wtq_stream_send(held[i], NULL, 0, WTQ_SEND_FIN, NULL), WTQ_OK);
         complete_all_sends();
     }
+    wtq_stream_budget_t budget = WTQ_STREAM_BUDGET_INIT;
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(sess, &budget), WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(budget.engine_capacity, 32);
+    WTQ_TEST_CHECK_EQ_INT(budget.api_capacity, 31);
+    WTQ_TEST_CHECK_EQ_INT(budget.native_capacity, 35);
+    WTQ_TEST_CHECK_EQ_INT(budget.local_resident, 16);
+    WTQ_TEST_CHECK_EQ_INT(budget.local_wt_live, 0);
+    WTQ_TEST_CHECK_EQ_INT(budget.api_retained_terminal, 16);
+    unsigned opens = g_native_opens, starts = g_native_starts;
     uint64_t local_count = drv->local_uni_count;
     wtq_stream_t *extra = NULL;
     WTQ_TEST_CHECK_EQ_INT(wtq_session_open_uni(sess, &extra), WTQ_ERR_WOULD_BLOCK);
     WTQ_TEST_CHECK(extra == NULL);
+    WTQ_TEST_CHECK_EQ_INT(g_native_opens, opens);
+    WTQ_TEST_CHECK_EQ_INT(g_native_starts, starts);
     WTQ_TEST_CHECK_EQ_U64(drv->local_uni_count, local_count);
+
+    /* Both peer positions remain independent while all local leases are held.
+     * Hold an explicit API borrow to exercise native FIN-before-publication. */
     struct wtq_dstream *queued[2];
+    wtq_stream_t *peer_handles[2] = { 0 };
     const uint8_t prefix[] = { 0x40, 0x54, 0 };
+    wtq_api_session_enter(sess);
     for (unsigned i = 0; i < 2; ++i) {
         g_ord.n = 0;
         feed_peer_stream_started(drv, (HQUIC)(void *)&queued[i], false, 7u + 4u * i);
         queued[i] = g_ord.call[0].ctx;
         WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(queued[i], prefix, sizeof(prefix), true), 3);
-        WTQ_TEST_CHECK(queued[i]->fin_pending && queued[i]->admission.es == NULL);
+        WTQ_TEST_CHECK(queued[i]->fin_pending && queued[i]->admission.prefix.es == NULL);
+        lifetime_shutdown(queued[i]);
+        WTQ_TEST_CHECK(queued[i]->occupied);
     }
     WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 0);
-    /* A prefix-only FIN may complete the native stream before an API slot
-     * exists. Native shutdown must not retire this unpublished FIN debt. */
-    lifetime_shutdown(queued[0]);
-    lifetime_shutdown(queued[1]);
-    WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(sess), WTQ_OK);
-    WTQ_TEST_CHECK(queued[0]->occupied && queued[1]->occupied);
+    WTQ_TEST_CHECK(!wtq_api_session_leave(sess));
     int native_enables = g_rse_calls;
-    g_rse_fail = 1; /* a native-terminal handle cannot be enabled again */
-    wtq_stream_release(held[0]); held[0] = NULL;
-    WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 0);
+    g_rse_fail = 1; /* native-terminal handles must never be enabled */
     g_pr.retain_stream = true;
     g_pr.pause_open = true;
     WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(sess), WTQ_OK);
-    WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 1);
-    WTQ_TEST_CHECK_EQ_INT(g_pr.fin_calls, 0);
-    WTQ_TEST_CHECK_EQ_INT(wtq_stream_resume_receive(g_pr.stream), WTQ_OK);
-    WTQ_TEST_CHECK_EQ_INT(g_pr.fin_calls, 1);
-    g_pr.pause_open = false;
-    WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(sess), WTQ_OK);
-    WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 1); /* terminal held lease still consumes API slot */
-    wtq_stream_release(g_pr.stream);
-    WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 1);
-    WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(sess), WTQ_OK);
     WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 2);
-    WTQ_TEST_CHECK_EQ_INT(g_pr.fin_calls, 2); /* no new RECEIVE/packet was delivered */
+    WTQ_TEST_CHECK_EQ_INT(g_pr.fin_calls, 0);
+    /* The API positions are stable and distinct; the callback saved the last.
+     * Capture the first through its existing engine-to-API backlink. */
+    peer_handles[0] = wtq_estream_get_user(queued[0]->ectx);
+    peer_handles[1] = g_pr.stream;
+    WTQ_TEST_CHECK(peer_handles[0] != NULL && peer_handles[0] != peer_handles[1]);
+    for (unsigned i = 0; i < 2; ++i) {
+        WTQ_TEST_CHECK_EQ_INT(wtq_stream_resume_receive(peer_handles[i]), WTQ_OK);
+        WTQ_TEST_CHECK(queued[i]->occupied && queued[i]->credit_held);
+    }
+    WTQ_TEST_CHECK_EQ_INT(g_pr.fin_calls, 2);
     WTQ_TEST_CHECK_EQ_INT(g_rse_calls, native_enables);
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(sess, &budget), WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(budget.local_resident, 16);
+    WTQ_TEST_CHECK_EQ_INT(budget.api_retained_terminal, 18);
+    WTQ_TEST_CHECK_EQ_INT(budget.peer_wt_waiting, 0);
+    g_pr.pause_open = false;
     g_rse_fail = 0;
-    wtq_stream_release(g_pr.stream);
+    for (unsigned i = 0; i < 2; ++i) wtq_stream_release(peer_handles[i]);
+    WTQ_TEST_CHECK(queued[0]->occupied && queued[1]->occupied);
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(sess), WTQ_OK);
+    WTQ_TEST_CHECK(!queued[0]->occupied && !queued[1]->occupied);
+
+    /* Final API release alone cannot recycle a still-native local reservation. */
+    wtq_stream_release(held[0]); held[0] = NULL;
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(sess), WTQ_OK);
+    WTQ_TEST_CHECK(local_ds[0]->occupied && !local_ds[0]->credit_held);
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_open_uni(sess, &extra), WTQ_ERR_WOULD_BLOCK);
+    WTQ_TEST_CHECK(extra == NULL);
+    WTQ_TEST_CHECK_EQ_INT(g_native_opens, opens);
+    WTQ_TEST_CHECK_EQ_INT(g_native_starts, starts);
+    lifetime_shutdown(local_ds[0]);
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(sess), WTQ_OK);
+    WTQ_TEST_CHECK(!local_ds[0]->occupied);
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_open_bidi(sess, &extra), WTQ_OK);
+    WTQ_TEST_CHECK(extra != NULL);
+    WTQ_TEST_CHECK_EQ_INT(g_native_opens, opens + 1);
+    WTQ_TEST_CHECK_EQ_INT(g_native_starts, starts + 1);
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(sess, &budget), WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(budget.local_resident, 16);
+    WTQ_TEST_CHECK_EQ_INT(budget.local_high_water, 16);
+    WTQ_TEST_CHECK_EQ_U64(budget.local_open_blocked, 2);
+    complete_all_sends();
     for (size_t i = 1; i < 16; ++i) wtq_stream_release(held[i]);
     wtq_api_session_admission_detach(sess);
     wtq_session_release(sess);
@@ -2616,7 +3035,6 @@ static int test_bounded_handle_debt(void)
     wtq_msq_conn_free(drv);
     return failures;
 }
-
 static unsigned abort_nested_errors;
 static QUIC_STATUS QUIC_API abort_shutdown_inline(HQUIC handle,
     QUIC_STREAM_SHUTDOWN_FLAGS flags, QUIC_UINT62 code)
@@ -2674,7 +3092,7 @@ static int test_abort_shutdown_completion(void)
                 lifetime_shutdown(ds);
                 WTQ_TEST_CHECK_EQ_INT(g_pr.closed_calls, i + 1);
                 WTQ_TEST_CHECK_EQ_INT(g_pr.terminal_order, 0);
-                WTQ_TEST_CHECK_EQ_INT(admission_credit_closes, 1);
+                WTQ_TEST_CHECK_EQ_INT(admission_credit_closes, bounded ? 0 : 1);
                 complete_all_sends();
                 wtq_stream_release(st);
                 lifetime_poll(drv);
@@ -2721,7 +3139,7 @@ static int test_abort_pooled_shutdown_credit(void)
             admission_credit_closes = 0;
             api.StreamClose = admission_close;
             lifetime_shutdown(ds);
-            WTQ_TEST_CHECK(ds->ectx == NULL && ds->admission.es == NULL);
+            WTQ_TEST_CHECK(ds->ectx == NULL && ds->admission.prefix.es == NULL);
             WTQ_TEST_CHECK(ds->occupied && ds->credit_held);
             WTQ_TEST_CHECK_EQ_INT(admission_credit_closes, 0);
             WTQ_TEST_CHECK_EQ_INT(g_pr.closed_calls, i + 1);
@@ -3023,6 +3441,7 @@ static int test_bounded_snapshot_continuation(void)
     }
     const uint8_t incomplete[] = { 0xc0 };
     const uint8_t prefix[] = { 0x40, 0x54, 0 };
+    wtq_api_session_enter(sess);
     WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(peers[0], incomplete, 1, false), 1);
     WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(peers[1], prefix, sizeof(prefix), true), 3);
     WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 0);
@@ -3031,12 +3450,13 @@ static int test_bounded_snapshot_continuation(void)
     admission_nested.lease = held[1]; held[1] = NULL;
     admission_nested.failures = 0;
     g_pr.opened_hook = admission_create_nested;
+    WTQ_TEST_CHECK(!wtq_api_session_leave(sess));
     WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(sess), WTQ_OK);
     failures += admission_nested.failures;
     WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 1);
     WTQ_TEST_CHECK_EQ_INT(g_pr.fin_calls, 1);
-    WTQ_TEST_CHECK(peers[0]->admission.es == NULL);
-    WTQ_TEST_CHECK(admission_nested.created->admission.state == 1);
+    WTQ_TEST_CHECK(peers[0]->admission.prefix.es == NULL);
+    WTQ_TEST_CHECK(admission_nested.created->admission.prefix.state == 1);
     /* The adapter coalesces this later explicit pass; no new packet is needed. */
     WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(sess), WTQ_OK);
     WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 2);
@@ -3082,7 +3502,7 @@ static int test_bounded_resident_reuse(void)
     WTQ_TEST_CHECK(replacement->generation != generation);
     WTQ_TEST_CHECK_EQ_INT(replacement->admission.reservation, 9);
     WTQ_TEST_CHECK_EQ_U64(peers[0]->id, 1);
-    WTQ_TEST_CHECK_EQ_INT(peers[0]->admission.fill, 1);
+    WTQ_TEST_CHECK_EQ_INT(peers[0]->admission.prefix.fill, 1);
     WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 0);
     wtq_api_session_admission_detach(sess);
     wtq_session_release(sess);
@@ -3108,6 +3528,7 @@ static int test_bounded_queued_terminals(void)
         feed_peer_stream_started(drv, (HQUIC)(void *)&locals, true, 1);
         struct wtq_dstream *ds = g_ord.call[0].ctx;
         const uint8_t prefix[] = { 0x40, 0x41, 0 };
+        wtq_api_session_enter(sess);
         WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(ds, prefix, sizeof(prefix), false), 3);
         for (unsigned i = 0; i < 2; ++i) {
             QUIC_STREAM_EVENT terminal = { .Type = i == order
@@ -3121,6 +3542,7 @@ static int test_bounded_queued_terminals(void)
         WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 0);
         WTQ_TEST_CHECK_EQ_INT(g_pr.terminal_order, 0);
         WTQ_TEST_CHECK_EQ_INT(wtq_stream_abort(locals[0], 0), WTQ_OK);
+        WTQ_TEST_CHECK(!wtq_api_session_leave(sess));
         WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(sess), WTQ_OK);
         WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 1);
         WTQ_TEST_CHECK_EQ_INT(g_pr.terminal_order, order == 0 ? 12 : 21);
@@ -3141,7 +3563,7 @@ static void admission_poison_free(void *p, size_t n, void *ctx)
     lifetime_free(p, n, ctx);
 }
 
-static int test_bounded_final_shutdown(void)
+static int bounded_final_shutdown_row(bool admit_peer)
 {
     int failures = 0;
     memset(&lifetime, 0, sizeof(lifetime));
@@ -3162,20 +3584,75 @@ static int test_bounded_final_shutdown(void)
     feed_peer_stream_started(drv, (HQUIC)(void *)&locals, false, 7);
     struct wtq_dstream *ds = g_ord.call[0].ctx;
     const uint8_t prefix[] = { 0x40, 0x54, 0 };
-    WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(ds, prefix, sizeof(prefix), true), 3);
+    wtq_stream_t *peer = NULL;
+    g_pr.retain_stream = true;
+    wtq_api_session_enter(sess);
+    WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(ds, prefix, sizeof(prefix), !admit_peer), 3);
     WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 0);
+    if (admit_peer) {
+        WTQ_TEST_CHECK(!wtq_api_session_leave(sess));
+        WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(sess), WTQ_OK);
+        WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 1);
+        peer = g_pr.stream;
+        WTQ_TEST_CHECK(peer != NULL && ds->ectx != NULL);
+        WTQ_TEST_CHECK_EQ_U64(wtq_stream_id(peer), 7);
+        wtq_api_session_enter(sess);
+    }
+    wtq_stream_budget_t before = WTQ_STREAM_BUDGET_INIT;
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(sess, &before), WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(before.local_wt_live, 12);
+    WTQ_TEST_CHECK_EQ_INT(before.peer_wt_live, admit_peer ? 1 : 0);
+    WTQ_TEST_CHECK_EQ_INT(before.peer_wt_waiting, admit_peer ? 0 : 1);
+    WTQ_TEST_CHECK_EQ_INT(before.api_retained_terminal, 0);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.fin_calls + g_pr.closed_calls, 0);
     QUIC_CONNECTION_EVENT done = { .Type = QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE };
     done.SHUTDOWN_COMPLETE.AppCloseInProgress = TRUE;
+    capture_terminal_budget = true;
     (void)wtq_msq_conn_callback(NULL, drv, &done); /* poisons and frees drv */
-    WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 0);
+    capture_terminal_budget = false;
+    WTQ_TEST_CHECK(!wtq_api_session_leave(sess));
+    WTQ_TEST_CHECK_EQ_INT(g_pr.opened, admit_peer ? 1 : 0);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.closed_calls, 12 + (admit_peer ? 1 : 0));
     size_t quantum = 0;
     wtq_receive_pause_mode_t mode = WTQ_RECEIVE_PAUSE_UNSUPPORTED;
     WTQ_TEST_CHECK_EQ_INT(wtq_session_receive_contract(sess, &quantum, &mode), WTQ_OK);
     WTQ_TEST_CHECK_EQ_SIZE(quantum, 65535);
     WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(sess), WTQ_ERR_CLOSED);
+    WTQ_TEST_CHECK_EQ_INT(terminal_budget_rc, WTQ_OK);
+    /* Freeze is after engine close, but before API teardown: the twelve
+     * send-only owners detach, while a peer receive-drain owner survives.
+     * Retained handles have not yet become API-terminal at this cutoff. */
+    WTQ_TEST_CHECK_EQ_INT(terminal_budget.peer_uni_resident, 2);
+    WTQ_TEST_CHECK_EQ_INT(terminal_budget.peer_bidi_resident, 0);
+    WTQ_TEST_CHECK_EQ_INT(terminal_budget.local_resident, 12);
+    WTQ_TEST_CHECK_EQ_INT(terminal_budget.local_wt_live, 0);
+    WTQ_TEST_CHECK_EQ_INT(terminal_budget.peer_wt_live, admit_peer ? 1 : 0);
+    WTQ_TEST_CHECK_EQ_INT(terminal_budget.peer_wt_waiting, admit_peer ? 0 : 1);
+    WTQ_TEST_CHECK_EQ_INT(terminal_budget.http_critical_live, 1);
+    WTQ_TEST_CHECK_EQ_INT(terminal_budget.http_request_live, 1);
+    WTQ_TEST_CHECK_EQ_INT(terminal_budget.api_retained_terminal, 0);
+    WTQ_TEST_CHECK_EQ_INT(terminal_budget.local_high_water, 12);
+    WTQ_TEST_CHECK_EQ_INT(terminal_budget.peer_high_water, 2);
+    WTQ_TEST_CHECK_EQ_U64(terminal_budget.local_open_blocked, 0);
+    WTQ_TEST_CHECK_EQ_U64(terminal_budget.admission_resume_failures, 0);
+    wtq_stream_budget_t frozen = WTQ_STREAM_BUDGET_INIT;
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(sess, &frozen), WTQ_OK);
+    WTQ_TEST_CHECK(memcmp(&frozen, &terminal_budget, sizeof(frozen)) == 0);
     for (size_t i = 0; i < 12; ++i) wtq_stream_release(locals[i]);
+    if (peer) wtq_stream_release(peer);
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(sess, &frozen), WTQ_OK);
+    WTQ_TEST_CHECK(memcmp(&frozen, &terminal_budget, sizeof(frozen)) == 0);
     wtq_session_release(sess);
     WTQ_TEST_CHECK_EQ_SIZE(lifetime.live, 0);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.allocations, lifetime.free_calls);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.allocated_bytes, lifetime.freed_bytes);
+    return failures;
+}
+
+static int test_bounded_final_shutdown(void)
+{
+    int failures = bounded_final_shutdown_row(false);
+    failures += bounded_final_shutdown_row(true);
     return failures;
 }
 
@@ -3203,11 +3680,13 @@ static int test_admission_resume_failure(void)
         feed_peer_stream_started(drv, (HQUIC)(void *)&locals, false, 7);
         struct wtq_dstream *ds = g_ord.call[0].ctx;
         const uint8_t wire[] = { 0x40, 0x54, 0, 'x', 'y' };
+        wtq_api_session_enter(sess);
         WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(ds, wire, sizeof(wire), true), 3);
         WTQ_TEST_CHECK_EQ_INT(wtq_stream_abort(locals[0], 0), WTQ_OK);
         api.StreamReceiveSetEnabled = admission_counted_enable;
         admission_enable_attempts = 0;
         g_rse_fail = 2;
+        WTQ_TEST_CHECK(!wtq_api_session_leave(sess));
         if (root == 0 || root >= 3) {
             QUIC_CONNECTION_EVENT ev = { .Type = QUIC_CONNECTION_EVENT_DATAGRAM_STATE_CHANGED };
             (void)wtq_msq_conn_callback(NULL, drv, &ev);
@@ -3289,6 +3768,7 @@ static int test_admission_bidi_reset(void)
             /* The send recorder uses its fake native handle as callback ctx. */
             ds->stream = (HQUIC)(void *)ds;
             const uint8_t wire[] = { 0x40, 0x41, 0, 'x', 'y' };
+            wtq_api_session_enter(sess);
             WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(ds, wire, sizeof(wire), true), 3);
             api.StreamReceiveSetEnabled = admission_counted_enable;
             admission_enable_attempts = 0;
@@ -3302,6 +3782,7 @@ static int test_admission_bidi_reset(void)
             }
             WTQ_TEST_CHECK_EQ_INT(wtq_stream_abort(locals[0], 0), WTQ_OK);
             unsigned closed = g_pr.closed_calls;
+            WTQ_TEST_CHECK(!wtq_api_session_leave(sess));
             QUIC_CONNECTION_EVENT conn_ev = { .Type = QUIC_CONNECTION_EVENT_DATAGRAM_STATE_CHANGED };
             QUIC_STREAM_EVENT stream_ev = { .Type = QUIC_STREAM_EVENT_IDEAL_SEND_BUFFER_SIZE };
             if (root == 0)
@@ -3381,19 +3862,20 @@ static int test_admission_fifo(void)
             ids[0] = 15;
         }
         unsigned first = row == 0 || row == 3 ? 1u : 0u;
+        wtq_api_session_enter(sess);
         for (unsigned n = 0; n < 2; ++n) {
             unsigned i = n == 0 ? first : 1u - first;
             const uint8_t wire[] = { 0x40, bidi[i] ? 0x41 : 0x54, 0 };
             WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(peers[i], wire, sizeof(wire), false), 3);
         }
-        WTQ_TEST_CHECK_EQ_INT(wtq_stream_abort(locals[0], 0), WTQ_OK);
-        WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(sess), WTQ_OK);
-        WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 1);
-        WTQ_TEST_CHECK_EQ_U64(wtq_stream_id(g_pr.stream), ids[first]);
-        WTQ_TEST_CHECK_EQ_INT(wtq_stream_abort(locals[1], 0), WTQ_OK);
+        WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 0);
+        WTQ_TEST_CHECK(!wtq_api_session_leave(sess));
         WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(sess), WTQ_OK);
         WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 2);
+        WTQ_TEST_CHECK_EQ_U64(g_pr.opened_ids[0], ids[first]);
+        WTQ_TEST_CHECK_EQ_U64(g_pr.opened_ids[1], ids[1u - first]);
         WTQ_TEST_CHECK_EQ_U64(wtq_stream_id(g_pr.stream), ids[1u - first]);
+        WTQ_TEST_CHECK_EQ_INT(g_pr.closed_calls, 0); /* no local closure bought admission */
         wtq_api_session_admission_detach(sess);
         wtq_session_release(sess);
         drv->session = NULL; drv->conn = NULL;
@@ -3470,8 +3952,798 @@ static int test_send_commit_dispatch(void)
     return failures;
 }
 
+static int test_stream_budget_plan_and_oom(void)
+{
+    int failures = 0;
+    static const uint32_t invalid[][3] = {
+        { 0, 7, 16 }, { 2, 7, 16 }, { 8, 0, 16 }, { 1024, 1, 16 },
+        { 3, 1022, 16 }, { 8, 7, 1025 }, { UINT32_MAX, 7, 16 },
+        { 8, UINT32_MAX, 16 }, { 8, 7, UINT32_MAX },
+    };
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+        wtq_stream_plan_v1_t plan, before;
+        memset(&plan, 0xa5, sizeof(plan));
+        plan.struct_size = sizeof(plan);
+        before = plan;
+        WTQ_TEST_CHECK_EQ_INT(wtq_api_stream_plan_v1(invalid[i][0], invalid[i][1],
+            invalid[i][2], true, sizeof(struct wtq_dstream),
+            sizeof(struct wtq_msq_admission_snapshot), &plan), WTQ_ERR_INVALID_ARG);
+        WTQ_TEST_CHECK(memcmp(&plan, &before, sizeof(plan)) == 0);
+    }
+    wtq_stream_plan_v1_t plan = { .struct_size = sizeof(plan) };
+    WTQ_TEST_CHECK_EQ_INT(wtq_api_stream_plan_v1(3, 1021, 1024, true,
+        sizeof(struct wtq_dstream), sizeof(struct wtq_msq_admission_snapshot), &plan), WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(plan.budget.engine_capacity, 2049);
+    WTQ_TEST_CHECK_EQ_INT(plan.budget.api_capacity, 2048);
+    WTQ_TEST_CHECK_EQ_INT(plan.budget.native_capacity, 2052);
+    WTQ_TEST_CHECK_EQ_U64(plan.budget.capacity_bytes, plan.engine_bytes + plan.api_bytes +
+        plan.native_bytes + plan.scratch_bytes);
+    WTQ_TEST_CHECK(plan.budget.capacity_bytes <= WTQ_STREAM_CAPACITY_BYTES_MAX);
+    fprintf(stderr, "stream-budget max geometry: engine=2049 api=2048 native=2052 bytes=%llu\n",
+        (unsigned long long)plan.budget.capacity_bytes);
+    WTQ_TEST_CHECK_EQ_INT(wtq_api_stream_plan_v1(8, 7, 16, true, SIZE_MAX, 16, &plan),
+        WTQ_ERR_INVALID_ARG);
+    WTQ_TEST_CHECK_EQ_INT(wtq_api_stream_plan_v1(8, 7, 16, true, 16, SIZE_MAX, &plan),
+        WTQ_ERR_INVALID_ARG);
+    WTQ_TEST_CHECK_EQ_INT(wtq_api_stream_plan_v1(8, 7, 16, true,
+        WTQ_STREAM_CAPACITY_BYTES_MAX, 16, &plan), WTQ_ERR_INVALID_ARG);
+    /* Each product fits: native=35 MiB, scratch=30 MiB. Only the
+     * aggregate ceiling rejects this otherwise valid geometry. */
+    const size_t mib = 1024u * 1024u;
+    size_t native_bytes = 0, scratch_bytes = 0;
+    WTQ_TEST_CHECK(wtq_capacity_mul(35, mib, &native_bytes));
+    WTQ_TEST_CHECK(wtq_capacity_mul(15, 2 * mib, &scratch_bytes));
+    WTQ_TEST_CHECK_EQ_SIZE(native_bytes, 35 * mib);
+    WTQ_TEST_CHECK_EQ_SIZE(scratch_bytes, 30 * mib);
+    memset(&plan, 0xa5, sizeof(plan));
+    plan.struct_size = sizeof(plan);
+    wtq_stream_plan_v1_t unchanged = plan;
+    WTQ_TEST_CHECK_EQ_INT(wtq_api_stream_plan_v1(8, 7, 16, true,
+        mib, 2 * mib, &plan), WTQ_ERR_INVALID_ARG);
+    WTQ_TEST_CHECK(memcmp(&plan, &unchanged, sizeof(plan)) == 0);
+    size_t bytes = 0;
+    WTQ_TEST_CHECK(wtq_capacity_add(WTQ_STREAM_CAPACITY_BYTES_MAX - 1, 1, &bytes));
+    WTQ_TEST_CHECK_EQ_SIZE(bytes, WTQ_STREAM_CAPACITY_BYTES_MAX);
+    WTQ_TEST_CHECK(!wtq_capacity_add(WTQ_STREAM_CAPACITY_BYTES_MAX, 1, &bytes));
+    WTQ_TEST_CHECK(!wtq_capacity_add(SIZE_MAX, 1, &bytes));
+    WTQ_TEST_CHECK(!wtq_capacity_mul(SIZE_MAX, 2, &bytes));
+    uint64_t saturated = UINT64_MAX - 1;
+    wtq_counter_increment(&saturated);
+    wtq_counter_increment(&saturated);
+    WTQ_TEST_CHECK_EQ_U64(saturated, UINT64_MAX);
+
+    const wtq_alloc_t alloc = { .alloc = lifetime_alloc, .free = lifetime_free };
+    for (unsigned client = 0; client < 2; ++client) {
+        for (size_t fail = 1; fail <= 6; ++fail) {
+            memset(&lifetime, 0, sizeof(lifetime));
+            lifetime.fail_at = fail;
+            QUIC_API_TABLE api;
+            ord_api(&api);
+            unsigned opens = g_native_opens, starts = g_native_starts;
+            struct wtq_driver *drv = wtq_msq_conn_new(&alloc, &api, client != 0);
+            wtq_session_t *session = NULL;
+            if (drv) {
+                wtq_session_events_t ev = WTQ_SESSION_EVENTS_INIT;
+                wtq_api_session_cfg_t cfg = {
+                    .alloc = &alloc, .perspective = client ? WTQ_PERSPECTIVE_CLIENT : WTQ_PERSPECTIVE_SERVER,
+                    .events = &ev, .drv = drv, .ops = wtq_msq_driver_ops(),
+                };
+                wtq_msquic_tuning_t tuning = WTQ_MSQUIC_TUNING_INIT;
+                WTQ_TEST_CHECK_EQ_INT(wtq_msq_session_create_bounded(drv, &cfg, &tuning, &session),
+                    fail <= 5 ? WTQ_ERR_NOMEM : WTQ_OK);
+                WTQ_TEST_CHECK((session != NULL) == (fail == 6));
+                if (session) {
+                    WTQ_TEST_CHECK_EQ_SIZE(lifetime.live, 5);
+                    wtq_stream_budget_t b = WTQ_STREAM_BUDGET_INIT;
+                    WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(session, &b), WTQ_OK);
+                    WTQ_TEST_CHECK_EQ_INT(b.engine_capacity, 31 + client);
+                    WTQ_TEST_CHECK_EQ_INT(b.api_capacity, 31);
+                    WTQ_TEST_CHECK_EQ_INT(b.native_capacity, 34 + client);
+                    WTQ_TEST_CHECK_EQ_INT(b.peer_uni_resident + b.peer_bidi_resident + b.local_resident, 0);
+                    fprintf(stderr, "stream-budget default client=%u: engine=%u api=%u native=%u bytes=%llu\n",
+                        client, b.engine_capacity, b.api_capacity, b.native_capacity,
+                        (unsigned long long)b.capacity_bytes);
+                    wtq_session_release(session);
+                }
+                wtq_msq_conn_free(drv);
+            } else WTQ_TEST_CHECK_EQ_SIZE(fail, 1);
+            WTQ_TEST_CHECK_EQ_SIZE(lifetime.attempts, fail <= 5 ? fail : 5);
+            WTQ_TEST_CHECK_EQ_SIZE(lifetime.live, 0);
+            WTQ_TEST_CHECK_EQ_SIZE(lifetime.records, 0);
+            WTQ_TEST_CHECK_EQ_SIZE(lifetime.allocations, lifetime.free_calls);
+            WTQ_TEST_CHECK_EQ_SIZE(lifetime.allocated_bytes, lifetime.freed_bytes);
+            WTQ_TEST_CHECK_EQ_INT(g_native_opens, opens);
+            WTQ_TEST_CHECK_EQ_INT(g_native_starts, starts);
+        }
+    }
+
+    for (unsigned row = 0; row < 2; ++row) {
+        memset(&lifetime, 0, sizeof(lifetime));
+        QUIC_API_TABLE api;
+        ord_api(&api);
+        struct wtq_driver *drv = wtq_msq_conn_new(&alloc, &api, true);
+        WTQ_TEST_CHECK(drv != NULL);
+        if (!drv) continue;
+        wtq_driver_ops_t driver_ops = *wtq_msq_driver_ops();
+        if (row) driver_ops.recv_enable = NULL;
+        else driver_ops.caps &= ~WTQ_DCAP_RECV_FLOW_CONTROLLED;
+        wtq_session_events_t ev = WTQ_SESSION_EVENTS_INIT;
+        wtq_api_session_cfg_t cfg = { .alloc = &alloc,
+            .perspective = WTQ_PERSPECTIVE_CLIENT, .events = &ev,
+            .drv = drv, .ops = &driver_ops };
+        wtq_msquic_tuning_t tuning = WTQ_MSQUIC_TUNING_INIT;
+        wtq_session_t *session = NULL;
+        unsigned opens = g_native_opens, starts = g_native_starts;
+        WTQ_TEST_CHECK_EQ_INT(wtq_msq_session_create_bounded(drv, &cfg, &tuning, &session),
+            WTQ_ERR_UNSUPPORTED);
+        WTQ_TEST_CHECK(session == NULL && drv->peers == NULL && drv->admission_snapshot == NULL);
+        WTQ_TEST_CHECK_EQ_SIZE(lifetime.attempts, 3); /* driver and two backing arenas */
+        WTQ_TEST_CHECK_EQ_SIZE(lifetime.live, 1);
+        wtq_msq_conn_free(drv);
+        WTQ_TEST_CHECK_EQ_SIZE(lifetime.live, 0);
+        WTQ_TEST_CHECK_EQ_SIZE(lifetime.allocated_bytes, lifetime.freed_bytes);
+        WTQ_TEST_CHECK_EQ_INT(g_native_opens, opens);
+        WTQ_TEST_CHECK_EQ_INT(g_native_starts, starts);
+    }
+
+    /* Environment validation is before allocation/provider use. The table and
+     * registration are borrowed sentinels: this never opens native MsQuic. */
+    for (unsigned row = 0; row < 7; ++row) {
+        memset(&lifetime, 0, sizeof(lifetime));
+        QUIC_API_TABLE api = { 0 };
+        wtq_msquic_env_cfg_t cfg = WTQ_MSQUIC_ENV_CFG_INIT;
+        cfg.alloc = &alloc;
+        cfg.existing_api = &api;
+        cfg.existing_registration = (HQUIC)(void *)&cfg;
+        if (row == 0) cfg.tuning.peer_unidi_stream_count = 0;
+        if (row == 1) cfg.tuning.peer_bidi_stream_count = 0;
+        if (row == 2) cfg.tuning.peer_unidi_stream_count = 2;
+        if (row == 3) cfg.tuning.peer_bidi_stream_count = 1024;
+        if (row == 4) {
+            cfg.tuning.peer_unidi_stream_count = 9;
+            cfg.tuning.peer_bidi_stream_count = 8;
+        }
+        if (row == 5) memset(&cfg.tuning, 0, sizeof(cfg.tuning));
+        if (row == 6) cfg.struct_size = offsetof(wtq_msquic_env_cfg_t, tuning) + 1;
+        wtq_msquic_env_t *env = NULL;
+        WTQ_TEST_CHECK_EQ_INT(wtq_msquic_env_open(&cfg, &env), row < 4 ? WTQ_ERR_INVALID_ARG : WTQ_OK);
+        WTQ_TEST_CHECK_EQ_SIZE(lifetime.attempts, row < 4 ? 0 : 1);
+        if (env) {
+            WTQ_TEST_CHECK_EQ_INT(env->tuning.peer_unidi_stream_count, row == 4 ? 9 : 8);
+            WTQ_TEST_CHECK_EQ_INT(env->tuning.peer_bidi_stream_count, row == 4 ? 8 : 7);
+            wtq_msquic_env_close(env);
+        }
+        WTQ_TEST_CHECK_EQ_SIZE(lifetime.live, 0);
+        WTQ_TEST_CHECK_EQ_SIZE(lifetime.allocated_bytes, lifetime.freed_bytes);
+    }
+    return failures;
+}
+
+static int test_stream_budget_allocation_delta(void)
+{
+    int failures = 0;
+    size_t requested[2] = { 0 };
+    uint64_t reported[2] = { 0 };
+    const wtq_alloc_t alloc = { .alloc = lifetime_alloc, .free = lifetime_free };
+    for (unsigned row = 0; row < 2; ++row) {
+        memset(&lifetime, 0, sizeof(lifetime));
+        QUIC_API_TABLE api;
+        ord_api(&api);
+        unsigned opens = g_native_opens, starts = g_native_starts;
+        struct wtq_driver *drv = wtq_msq_conn_new(&alloc, &api, true);
+        WTQ_TEST_CHECK(drv != NULL);
+        if (!drv) continue;
+        drv->max_local_streams = 16 + row;
+        wtq_session_events_t ev = WTQ_SESSION_EVENTS_INIT;
+        const wtq_api_session_cfg_t cfg = { .alloc = &alloc,
+            .perspective = WTQ_PERSPECTIVE_CLIENT, .events = &ev,
+            .drv = drv, .ops = wtq_msq_driver_ops() };
+        wtq_msquic_tuning_t tuning = WTQ_MSQUIC_TUNING_INIT;
+        tuning.peer_unidi_stream_count = (uint16_t)(8 + row);
+        tuning.peer_bidi_stream_count = (uint16_t)(7 + row);
+        wtq_session_t *session = NULL;
+        WTQ_TEST_CHECK_EQ_INT(wtq_msq_session_create_bounded(drv, &cfg, &tuning, &session), WTQ_OK);
+        WTQ_TEST_CHECK(session != NULL);
+        if (session) {
+            wtq_stream_budget_t b = WTQ_STREAM_BUDGET_INIT;
+            WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(session, &b), WTQ_OK);
+            WTQ_TEST_CHECK_EQ_INT(b.api_capacity, 31 + 3 * row);
+            WTQ_TEST_CHECK_EQ_SIZE(lifetime.allocations, 5);
+            WTQ_TEST_CHECK_EQ_SIZE(lifetime.free_calls, 0);
+            requested[row] = lifetime.allocated_bytes;
+            reported[row] = b.capacity_bytes;
+            wtq_session_release(session);
+        }
+        wtq_msq_conn_free(drv);
+        WTQ_TEST_CHECK_EQ_SIZE(lifetime.live, 0);
+        WTQ_TEST_CHECK_EQ_SIZE(lifetime.allocations, lifetime.free_calls);
+        WTQ_TEST_CHECK_EQ_SIZE(lifetime.allocated_bytes, lifetime.freed_bytes);
+        WTQ_TEST_CHECK_EQ_INT(g_native_opens, opens);
+        WTQ_TEST_CHECK_EQ_INT(g_native_starts, starts);
+    }
+    /* No connect/start traffic: constant driver/API/engine base sizes cancel.
+     * This measures allocator requests, independently of the plan's members. */
+    WTQ_TEST_CHECK(requested[1] > requested[0]);
+    WTQ_TEST_CHECK(reported[1] > reported[0]);
+    WTQ_TEST_CHECK_EQ_U64(reported[1] - reported[0], requested[1] - requested[0]);
+    fprintf(stderr, "stream-budget allocation delta: requested=%zu/%zu reported=%llu/%llu\n",
+        requested[0], requested[1], (unsigned long long)reported[0],
+        (unsigned long long)reported[1]);
+    return failures;
+}
+
+static int test_stream_budget_waiting_peer_local_open(void)
+{
+    int failures = 0;
+    const wtq_alloc_t alloc = { .alloc = lifetime_alloc, .free = lifetime_free };
+    for (unsigned bidi = 0; bidi < 2; ++bidi) {
+        memset(&lifetime, 0, sizeof(lifetime));
+        QUIC_API_TABLE api;
+        wtq_session_t *session = NULL;
+        struct wtq_driver *drv = pause_estab_plan(&api, &session, &alloc, true, NULL, 2);
+        WTQ_TEST_CHECK(drv != NULL && session != NULL);
+        if (!drv) continue;
+        api.StreamClose = lifetime_close;
+        wtq_stream_t *local = NULL, *peer = NULL;
+        struct wtq_dstream *ds = stream_budget_peer(drv, 1, 7, false, &failures);
+        if (!ds) goto cleanup;
+        g_pr.retain_stream = true;
+        const uint8_t wire[] = { 0x40, 0x54, 0, 'x' };
+        wtq_api_session_enter(session);
+        WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(ds, wire, sizeof(wire), true), 3);
+        WTQ_TEST_CHECK(ds->admission.prefix.state == 1 && ds->ectx == NULL);
+        WTQ_TEST_CHECK_EQ_INT(g_pr.opened + g_pr.data_calls, 0);
+        wtq_stream_budget_t b = WTQ_STREAM_BUDGET_INIT;
+        WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(session, &b), WTQ_OK);
+        WTQ_TEST_CHECK_EQ_INT(b.peer_wt_waiting, 1);
+        WTQ_TEST_CHECK_EQ_INT(b.local_resident, 0);
+        WTQ_TEST_CHECK_EQ_INT(b.max_local_streams, 2);
+        unsigned opens = g_native_opens, starts = g_native_starts;
+        int sends = g_sent_n, enables = g_rse_calls;
+        int shutdowns = g_conn_shutdowns;
+        uint64_t uni_count = drv->local_uni_count, bidi_count = drv->local_bidi_count;
+        WTQ_TEST_CHECK_EQ_INT(bidi ? wtq_session_open_bidi(session, &local) :
+            wtq_session_open_uni(session, &local), WTQ_OK);
+        WTQ_TEST_CHECK(local != NULL);
+        if (local) {
+            wtq_stream_add_ref(local);
+            WTQ_TEST_CHECK_EQ_U64(wtq_stream_id(local), bidi ? 4 : 14);
+        }
+        WTQ_TEST_CHECK_EQ_INT(g_native_opens, opens + 1);
+        WTQ_TEST_CHECK_EQ_INT(g_native_starts, starts + 1);
+        WTQ_TEST_CHECK_EQ_INT(g_sent_n, sends + 1); /* local WT preamble */
+        WTQ_TEST_CHECK_EQ_U64(drv->local_uni_count, uni_count + (bidi ? 0 : 1));
+        WTQ_TEST_CHECK_EQ_U64(drv->local_bidi_count, bidi_count + (bidi ? 1 : 0));
+        WTQ_TEST_CHECK_EQ_INT(g_rse_calls, enables);
+        WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(session), WTQ_OK);
+        WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(session, &b), WTQ_OK);
+        WTQ_TEST_CHECK_EQ_INT(b.local_resident, 1);
+        WTQ_TEST_CHECK_EQ_INT(b.local_wt_live, 1);
+        WTQ_TEST_CHECK_EQ_INT(b.peer_wt_live, 0);
+        WTQ_TEST_CHECK_EQ_INT(b.peer_wt_waiting, 1);
+        WTQ_TEST_CHECK_EQ_U64(b.local_open_blocked, 0);
+        WTQ_TEST_CHECK_EQ_INT(g_rse_calls, enables);
+        WTQ_TEST_CHECK_EQ_INT(lifetime.closes, 0);
+        WTQ_TEST_CHECK_EQ_INT(g_conn_shutdowns, shutdowns);
+        WTQ_TEST_CHECK_EQ_INT(g_pr.opened + g_pr.data_calls + g_pr.fin_calls + g_pr.closed_calls, 0);
+        WTQ_TEST_CHECK(ds->admission.prefix.state == 1 && ds->ectx == NULL);
+        failures += stream_budget_no_shutdowns();
+        complete_all_sends();
+        WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 0);
+        WTQ_TEST_CHECK(!wtq_api_session_leave(session));
+        WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(session), WTQ_OK);
+        WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 1);
+        peer = g_pr.stream;
+        WTQ_TEST_CHECK(peer != NULL);
+        WTQ_TEST_CHECK_EQ_U64(wtq_stream_id(peer), 7);
+        WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(ds, wire + 3, 1, true), 1);
+        WTQ_TEST_CHECK_EQ_INT(g_pr.data_calls, 1);
+        WTQ_TEST_CHECK_EQ_INT(g_pr.fin_calls, 1);
+        WTQ_TEST_CHECK_EQ_INT(g_pr.closed_calls, 1);
+        WTQ_TEST_CHECK_EQ_SIZE(g_pr.bytes, 1);
+        WTQ_TEST_CHECK_EQ_SIZE(g_pr.buf_len, 1);
+        WTQ_TEST_CHECK_EQ_INT(g_pr.buf[0], 'x');
+        WTQ_TEST_CHECK_EQ_INT(g_native_opens, opens + 1);
+        WTQ_TEST_CHECK_EQ_INT(g_native_starts, starts + 1);
+        WTQ_TEST_CHECK_EQ_INT(lifetime.closes, 0);
+        WTQ_TEST_CHECK_EQ_INT(g_conn_shutdowns, shutdowns);
+cleanup:
+        complete_all_sends();
+        if (peer) wtq_stream_release(peer);
+        if (local) wtq_stream_release(local);
+        wtq_api_session_admission_detach(session);
+        wtq_session_release(session);
+        drv->session = NULL; drv->conn = NULL;
+        wtq_msq_conn_free(drv);
+        WTQ_TEST_CHECK_EQ_SIZE(lifetime.live, 0);
+        WTQ_TEST_CHECK_EQ_SIZE(lifetime.allocations, lifetime.free_calls);
+        WTQ_TEST_CHECK_EQ_SIZE(lifetime.allocated_bytes, lifetime.freed_bytes);
+    }
+    return failures;
+}
+
+static int test_stream_budget_configured_query(void)
+{
+    int failures = 0;
+    QUIC_API_TABLE api;
+    wtq_session_t *session = NULL;
+    wtq_msquic_tuning_t tuning = WTQ_MSQUIC_TUNING_INIT;
+    tuning.peer_unidi_stream_count = 9;
+    tuning.peer_bidi_stream_count = 8;
+    memset(&lifetime, 0, sizeof(lifetime));
+    const wtq_alloc_t alloc = { .alloc = lifetime_alloc, .free = lifetime_free };
+    struct wtq_driver *drv = pause_estab_plan(&api, &session, &alloc, true, &tuning, 4);
+    WTQ_TEST_CHECK(drv != NULL && session != NULL);
+    if (!drv) return failures;
+    size_t quantum = 0;
+    wtq_receive_pause_mode_t mode = WTQ_RECEIVE_PAUSE_UNSUPPORTED;
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_receive_contract(session, &quantum, &mode), WTQ_OK);
+    WTQ_TEST_CHECK_EQ_SIZE(quantum, 65535);
+    WTQ_TEST_CHECK_EQ_INT(mode, WTQ_RECEIVE_PAUSE_FLOW_CONTROLLED);
+    for (unsigned i = 0; i < 4; ++i) {
+        wtq_stream_t *st = NULL;
+        WTQ_TEST_CHECK_EQ_INT(i & 1 ? wtq_session_open_bidi(session, &st) :
+            wtq_session_open_uni(session, &st), WTQ_OK);
+        WTQ_TEST_CHECK(st != NULL);
+    }
+    complete_all_sends();
+    unsigned opens = g_native_opens, starts = g_native_starts;
+    wtq_stream_t *extra = NULL;
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_open_bidi(session, &extra), WTQ_ERR_WOULD_BLOCK);
+    WTQ_TEST_CHECK(extra == NULL);
+    WTQ_TEST_CHECK_EQ_INT(g_native_opens, opens);
+    WTQ_TEST_CHECK_EQ_INT(g_native_starts, starts);
+
+    wtq_stream_budget_t b = WTQ_STREAM_BUDGET_INIT;
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(session, &b), WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(b.engine_capacity, 22);
+    WTQ_TEST_CHECK_EQ_INT(b.api_capacity, 21);
+    WTQ_TEST_CHECK_EQ_INT(b.native_capacity, 25);
+    WTQ_TEST_CHECK_EQ_INT(b.local_resident, 4);
+    WTQ_TEST_CHECK_EQ_INT(b.local_wt_live, 4);
+    WTQ_TEST_CHECK_EQ_INT(b.http_request_live, 1);
+    WTQ_TEST_CHECK_EQ_INT(b.http_critical_live, 1);
+    WTQ_TEST_CHECK_EQ_INT(b.peer_uni_resident, 1);
+    WTQ_TEST_CHECK_EQ_U64(b.local_open_blocked, 1);
+    WTQ_TEST_CHECK_EQ_U64(b.capacity_bytes, drv->stream_plan.engine_bytes +
+        drv->stream_plan.api_bytes + drv->stream_plan.native_bytes + drv->stream_plan.scratch_bytes);
+    fprintf(stderr, "stream-budget U=9 B=8 L=4 client: engine=22 api=21 native=25 bytes=%llu\n",
+        (unsigned long long)b.capacity_bytes);
+    const size_t attempts = lifetime.attempts, frees = lifetime.free_calls;
+    int enables = g_rse_calls, opened = g_pr.opened;
+    struct { wtq_stream_budget_t value; uint8_t tail[16]; } future, before;
+    memset(&future, 0xa5, sizeof(future));
+    future.value.struct_size = sizeof(future);
+    before = future;
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(session, &future.value), WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(future.value.struct_size, sizeof(future));
+    WTQ_TEST_CHECK(memcmp(future.tail, before.tail, sizeof(future.tail)) == 0);
+    WTQ_TEST_CHECK_EQ_INT(future.value.reserved0 + future.value.reserved1, 0);
+    for (uint32_t size = 0; size < WTQ_STREAM_BUDGET_V1_SIZE; ++size) {
+        memset(&future, 0xa5, sizeof(future));
+        future.value.struct_size = size;
+        before = future;
+        WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(session, &future.value), WTQ_ERR_INVALID_ARG);
+        WTQ_TEST_CHECK(memcmp(&future, &before, sizeof(future)) == 0);
+    }
+    future.value.struct_size = WTQ_STREAM_BUDGET_V1_SIZE;
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(session, &future.value), WTQ_OK);
+    before = future;
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(NULL, &future.value), WTQ_ERR_INVALID_ARG);
+    WTQ_TEST_CHECK(memcmp(&future, &before, sizeof(future)) == 0);
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(session, NULL), WTQ_ERR_INVALID_ARG);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.attempts, attempts);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.free_calls, frees);
+    WTQ_TEST_CHECK_EQ_INT(g_native_opens, opens);
+    WTQ_TEST_CHECK_EQ_INT(g_native_starts, starts);
+    WTQ_TEST_CHECK_EQ_INT(g_rse_calls, enables);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.opened, opened);
+
+    /* Worst case: optional QPACK peers never arrive. Every remaining peer
+     * uni and every bidi is WT while all four locals stay occupied. */
+    wtq_stream_t *held[16] = { 0 };
+    g_pr.retain_stream = true;
+    for (unsigned i = 0; i < 16 && !failures; ++i) {
+        bool bidi = i >= 8;
+        unsigned reservation = bidi ? 9 + i - 8 : 1 + i;
+        uint64_t id = bidi ? 1 + 4u * (i - 8) : 7 + 4u * i;
+        struct wtq_dstream *ds = stream_budget_peer(drv, reservation, id, bidi, &failures);
+        if (!ds) break;
+        const uint8_t wire[] = { 0x40, bidi ? 0x41 : 0x54, 0, (uint8_t)i };
+        WTQ_TEST_CHECK_EQ_SIZE(stream_budget_deliver(ds, wire, sizeof(wire), false, &failures), sizeof(wire));
+        held[i] = g_pr.stream;
+        WTQ_TEST_CHECK_EQ_INT(g_pr.opened, i + 1);
+        WTQ_TEST_CHECK_EQ_U64(wtq_stream_id(held[i]), id);
+    }
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(session, &b), WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(b.peer_uni_resident, 9);
+    WTQ_TEST_CHECK_EQ_INT(b.peer_bidi_resident, 8);
+    WTQ_TEST_CHECK_EQ_INT(b.local_resident, 4);
+    WTQ_TEST_CHECK_EQ_INT(b.peer_wt_live, 16);
+    WTQ_TEST_CHECK_EQ_INT(b.local_wt_live, 4);
+    WTQ_TEST_CHECK_EQ_INT(b.peer_wt_waiting, 0);
+    WTQ_TEST_CHECK_EQ_INT(b.peer_high_water, 17);
+    WTQ_TEST_CHECK_EQ_INT(b.local_high_water, 4);
+    WTQ_TEST_CHECK_EQ_SIZE(stream_record_count(drv), 25);
+    WTQ_TEST_CHECK_EQ_SIZE(g_pr.bytes, 16);
+    for (unsigned i = 0; i < 16; ++i) WTQ_TEST_CHECK_EQ_INT(g_pr.buf[i], i);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.fin_calls + g_pr.closed_calls, 0);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.attempts, attempts);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.free_calls, frees);
+    for (unsigned i = 0; i < 16; ++i) wtq_stream_release(held[i]);
+    wtq_api_session_admission_detach(session);
+    wtq_session_release(session);
+    drv->session = NULL; drv->conn = NULL;
+    wtq_msq_conn_free(drv);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.live, 0);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.allocations, lifetime.free_calls);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.allocated_bytes, lifetime.freed_bytes);
+
+    drv = pause_estab(&api, &session);
+    WTQ_TEST_CHECK(drv != NULL);
+    if (drv) {
+        future.value.struct_size = sizeof(future);
+        before = future;
+        WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(session, &future.value), WTQ_ERR_UNSUPPORTED);
+        WTQ_TEST_CHECK(memcmp(&future, &before, sizeof(future)) == 0);
+        wtq_session_release(session);
+        drv->session = NULL; drv->conn = NULL;
+        wtq_msq_conn_free(drv);
+    }
+    return failures;
+}
+
+static int budget_established_failures;
+static struct wtq_dstream *budget_established_peer;
+
+static void budget_nested_established(wtq_session_t *session, void *user)
+{
+    int failures = 0;
+    struct wtq_driver *drv = user;
+    WTQ_TEST_CHECK(drv != NULL);
+    if (!drv) { ++budget_established_failures; return; }
+    wtq_stream_budget_t b = WTQ_STREAM_BUDGET_INIT;
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(session, &b), WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(b.api_capacity, 31);
+    budget_established_peer = stream_budget_peer(drv, 1, 7, false, &failures);
+    if (!budget_established_peer) {
+        budget_established_failures += failures;
+        return;
+    }
+    const uint8_t wire[] = { 0x40, 0x54, 0, 'x' };
+    WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(budget_established_peer, wire, sizeof(wire), true), 3);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 0);
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(session, &b), WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(b.peer_wt_waiting, 1);
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(session), WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 0);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.data_calls, 0);
+    budget_established_failures += failures;
+}
+
+static int test_stream_budget_established_barrier(void)
+{
+    int failures = 0;
+    QUIC_API_TABLE api;
+    wtq_session_t *session = NULL;
+    budget_established_failures = 0;
+    budget_established_peer = NULL;
+    pr_established_hook = budget_nested_established;
+    struct wtq_driver *drv = pause_estab_mode(&api, &session, wtq_alloc_default(), true);
+    pr_established_hook = NULL;
+    failures += budget_established_failures;
+    WTQ_TEST_CHECK(drv != NULL && budget_established_peer != NULL);
+    if (!drv) return failures;
+    if (!budget_established_peer) goto cleanup;
+    WTQ_TEST_CHECK_EQ_INT(g_pr.established, 1);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 0);
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(session), WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.opened, 1);
+    const uint8_t payload = 'x';
+    WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(budget_established_peer, &payload, 1, true), 1);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.data_calls, 1);
+    WTQ_TEST_CHECK_EQ_SIZE(g_pr.bytes, 1);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.fin_calls, 1);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.closed_calls, 1);
+    wtq_stream_budget_t b = WTQ_STREAM_BUDGET_INIT;
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(session, &b), WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(b.peer_wt_waiting, 0);
+cleanup:
+    wtq_api_session_admission_detach(session);
+    wtq_session_release(session);
+    drv->session = NULL; drv->conn = NULL;
+    wtq_msq_conn_free(drv);
+    return failures;
+}
+
+static QUIC_STATUS QUIC_API budget_open_fail(HQUIC conn,
+    QUIC_STREAM_OPEN_FLAGS flags, QUIC_STREAM_CALLBACK_HANDLER cb, void *ctx, HQUIC *out)
+{
+    (void)conn; (void)flags; (void)cb; (void)ctx; (void)out;
+    ++g_native_opens;
+    return QUIC_STATUS_INVALID_STATE;
+}
+
+static QUIC_STATUS QUIC_API budget_start_fail(HQUIC stream, QUIC_STREAM_START_FLAGS flags)
+{
+    (void)stream; (void)flags;
+    ++g_native_starts;
+    return QUIC_STATUS_INVALID_STATE;
+}
+
+static QUIC_STATUS QUIC_API budget_start_pending(HQUIC stream, QUIC_STREAM_START_FLAGS flags)
+{
+    (void)stream; (void)flags;
+    ++g_native_starts;
+    return QUIC_STATUS_PENDING;
+}
+
+static int test_stream_budget_index_and_retirement(void)
+{
+    int failures = 0;
+    QUIC_API_TABLE api;
+    wtq_session_t *session = NULL;
+    wtq_stream_t *local = NULL, *held = NULL;
+    wtq_msquic_tuning_t tuning = WTQ_MSQUIC_TUNING_INIT;
+    tuning.peer_unidi_stream_count = 256;
+    tuning.peer_bidi_stream_count = 1;
+    memset(&lifetime, 0, sizeof(lifetime));
+    const wtq_alloc_t alloc = { .alloc = lifetime_alloc, .free = lifetime_free };
+    struct wtq_driver *drv = pause_estab_plan(&api, &session, &alloc, true, &tuning, 1);
+    WTQ_TEST_CHECK(drv != NULL && session != NULL);
+    if (!drv) return failures;
+    api.StreamClose = lifetime_close;
+    wtq_stream_budget_t b = WTQ_STREAM_BUDGET_INIT;
+    WTQ_TEST_CHECK_EQ_SIZE(stream_record_count(drv), 5);
+    size_t attempts = lifetime.attempts, frees = lifetime.free_calls;
+    for (unsigned row = 0; row < 2; ++row) {
+        unsigned opens = g_native_opens, starts = g_native_starts;
+        api.StreamOpen = row ? rec_stream_open : budget_open_fail;
+        api.StreamStart = row ? budget_start_fail : rec_stream_start;
+        WTQ_TEST_CHECK_EQ_INT(wtq_session_open_uni(session, &local), WTQ_ERR_BACKEND);
+        WTQ_TEST_CHECK(local == NULL);
+        WTQ_TEST_CHECK_EQ_INT(g_native_opens, opens + 1);
+        WTQ_TEST_CHECK_EQ_INT(g_native_starts, starts + row);
+        WTQ_TEST_CHECK_EQ_INT(lifetime.closes, row);
+        WTQ_TEST_CHECK_EQ_U64(drv->local_uni_count, 3);
+        WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(session, &b), WTQ_OK);
+        WTQ_TEST_CHECK_EQ_INT(b.local_resident + b.local_wt_live + b.api_retained_terminal, 0);
+        WTQ_TEST_CHECK_EQ_U64(b.local_open_blocked, 0);
+        WTQ_TEST_CHECK_EQ_SIZE(stream_record_count(drv), 5);
+        WTQ_TEST_CHECK_EQ_SIZE(lifetime.attempts, attempts);
+        WTQ_TEST_CHECK_EQ_SIZE(lifetime.free_calls, frees);
+    }
+    api.StreamOpen = rec_stream_open;
+    api.StreamStart = budget_start_pending;
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_open_uni(session, &local), WTQ_OK);
+    WTQ_TEST_CHECK(local != NULL);
+    if (!local) goto cleanup;
+    wtq_stream_add_ref(local);
+    struct wtq_dstream *local_ds = drv->streams;
+    uint64_t generation = local_ds->generation;
+    WTQ_TEST_CHECK_EQ_INT(local_ds->slot, 257);
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(session, &b), WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(b.local_resident, 1); /* START_COMPLETE has not arrived */
+    unsigned opens = g_native_opens, starts = g_native_starts;
+    wtq_stream_t *extra = NULL;
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_open_bidi(session, &extra), WTQ_ERR_WOULD_BLOCK);
+    WTQ_TEST_CHECK(extra == NULL);
+    WTQ_TEST_CHECK_EQ_INT(g_native_opens, opens);
+    WTQ_TEST_CHECK_EQ_INT(g_native_starts, starts);
+    complete_all_sends();
+
+    /* The first bidi reservation is 256, distinct from the control's slot 0.
+     * A uint8 truncation would either reject this input or corrupt control. */
+    struct wtq_dstream *peer = stream_budget_peer(drv, 256, 1, true, &failures);
+    if (!peer) goto cleanup;
+    g_pr.retain_stream = true;
+    const uint8_t wire[] = { 0x40, 0x41, 0, 'h' };
+    WTQ_TEST_CHECK_EQ_SIZE(stream_budget_deliver(peer, wire, sizeof(wire), false, &failures), sizeof(wire));
+    held = g_pr.stream;
+    WTQ_TEST_CHECK(held != NULL && peer->ectx != NULL);
+    WTQ_TEST_CHECK_EQ_INT(wtq_conn_stream_index_v2(wtq_api_session_conn(session), peer->ectx), 256);
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(session, &b), WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(b.peer_bidi_resident, 1);
+    WTQ_TEST_CHECK_EQ_INT(b.peer_wt_live, 1);
+    WTQ_TEST_CHECK_EQ_INT(b.http_critical_live, 1);
+    WTQ_TEST_CHECK_EQ_INT(b.http_request_live, 1);
+    WTQ_TEST_CHECK_EQ_SIZE(g_pr.bytes, 1);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.buf[0], 'h');
+
+    const uint8_t byte = 9;
+    wtq_span_t span = { .data = &byte, .len = 1 };
+    WTQ_TEST_CHECK_EQ_INT(wtq_stream_send(local, &span, 1, WTQ_SEND_FIN, NULL), WTQ_OK);
+    WTQ_TEST_CHECK(local_ds->ectx == NULL && local_ds->credit_held);
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(session, &b), WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(b.api_retained_terminal, 1);
+    WTQ_TEST_CHECK_EQ_INT(b.local_wt_live, 0);
+    lifetime_shutdown(local_ds);
+    WTQ_TEST_CHECK(local_ds->occupied && local_ds->send_refs != 0);
+    wtq_api_session_enter(session);
+    wtq_stream_release(local);
+    local = NULL;
+    complete_all_sends();
+    WTQ_TEST_CHECK(!local_ds->credit_held && local_ds->send_refs == 0);
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(session), WTQ_OK);
+    WTQ_TEST_CHECK(local_ds->occupied); /* outer callback/API borrow still pins */
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_open_uni(session, &extra), WTQ_ERR_WOULD_BLOCK);
+    WTQ_TEST_CHECK(extra == NULL);
+    WTQ_TEST_CHECK_EQ_INT(g_native_opens, opens);
+    WTQ_TEST_CHECK_EQ_INT(g_native_starts, starts);
+    WTQ_TEST_CHECK_EQ_INT(lifetime.closes, 1);
+    (void)wtq_api_session_leave(session);
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_service_stream_admission(session), WTQ_OK);
+    WTQ_TEST_CHECK(!local_ds->occupied);
+    WTQ_TEST_CHECK_EQ_INT(lifetime.closes, 2);
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_open_bidi(session, &extra), WTQ_OK);
+    WTQ_TEST_CHECK(extra != NULL && drv->streams == local_ds);
+    WTQ_TEST_CHECK(local_ds->generation > generation);
+    complete_all_sends();
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(session, &b), WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(b.engine_capacity, 259);
+    WTQ_TEST_CHECK_EQ_INT(b.api_capacity, 258);
+    WTQ_TEST_CHECK_EQ_INT(b.native_capacity, 262);
+    WTQ_TEST_CHECK_EQ_INT(b.local_resident, 1);
+    WTQ_TEST_CHECK_EQ_INT(b.peer_wt_live, 1);
+    WTQ_TEST_CHECK_EQ_INT(b.local_high_water, 1);
+    WTQ_TEST_CHECK_EQ_U64(b.local_open_blocked, 2);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.attempts, attempts + 3); /* two preambles and gather pool */
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.free_calls, frees + 2); /* preambles returned */
+cleanup:
+    complete_all_sends();
+    wtq_stream_release(local);
+    wtq_stream_release(held);
+    wtq_api_session_admission_detach(session);
+    wtq_session_release(session);
+    drv->session = NULL; drv->conn = NULL;
+    wtq_msq_conn_free(drv);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.live, 0);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.allocations, lifetime.free_calls);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.allocated_bytes, lifetime.freed_bytes);
+    return failures;
+}
+
+static int test_stream_budget_late_http(void)
+{
+    int failures = 0;
+    memset(&lifetime, 0, sizeof(lifetime));
+    memset(&g_pr, 0, sizeof(g_pr));
+    g_conn_shutdowns = g_term_fired = g_sent_n = g_rse_calls = g_rse_fail = 0;
+    QUIC_API_TABLE api;
+    ord_api(&api);
+    api.ConnectionShutdown = rec_conn_shutdown;
+    api.StreamOpen = rec_stream_open;
+    api.StreamStart = rec_stream_start;
+    api.StreamSend = rec_stream_send;
+    api.StreamReceiveSetEnabled = rec_recv_set_enabled;
+    api.StreamClose = lifetime_close;
+    const wtq_alloc_t alloc = { .alloc = lifetime_alloc, .free = lifetime_free };
+    struct wtq_driver *drv = wtq_msq_conn_new(&alloc, &api, false);
+    WTQ_TEST_CHECK(drv != NULL);
+    if (!drv) return failures;
+    drv->conn = (HQUIC)(void *)drv;
+    wtq_session_events_t ev = WTQ_SESSION_EVENTS_INIT;
+    ev.on_established = pr_on_established;
+    ev.on_stream_opened = pr_on_stream_opened;
+    ev.on_closed = cap_on_closed;
+    wtq_api_session_cfg_t cfg = { .alloc = &alloc,
+        .perspective = WTQ_PERSPECTIVE_SERVER, .events = &ev,
+        .drv = drv, .ops = wtq_msq_driver_ops() };
+    wtq_msquic_tuning_t tuning = WTQ_MSQUIC_TUNING_INIT;
+    tuning.peer_unidi_stream_count = 3;
+    wtq_session_t *session = NULL;
+    WTQ_TEST_CHECK_EQ_INT(wtq_msq_session_create_bounded(drv, &cfg, &tuning, &session), WTQ_OK);
+    WTQ_TEST_CHECK(session != NULL);
+    if (!session) goto cleanup;
+    drv->session = session;
+    wtq_serve_config_t path = WTQ_SERVE_CONFIG_INIT;
+    path.path = "/app";
+    WTQ_TEST_CHECK_EQ_INT(wtq_api_session_serve(session, &path, 1), WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(wtq_api_session_start(session, 0), WTQ_OK);
+    if (failures) goto cleanup;
+    /* All B native bidi positions classify as HTTP. The first six have
+     * incomplete HEADERS; the last is CONNECT, still before peer SETTINGS. */
+    for (unsigned i = 0; i < 6 && !failures; ++i) {
+        struct wtq_dstream *ds = stream_budget_peer(drv, 3 + i, 4u * i, true, &failures);
+        if (!ds) goto cleanup;
+        const uint8_t header_type = WTQ_H3_FRAME_HEADERS;
+        WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(ds, &header_type, 1, false), 1);
+        WTQ_TEST_CHECK(ds->ectx != NULL);
+        failures += stream_budget_no_shutdowns();
+    }
+    uint8_t section[256], wire[512];
+    size_t section_len = 0, len = 0;
+    WTQ_TEST_CHECK_EQ_INT(wtq_connect_encode_request("example.com", 11,
+        "/app", 4, NULL, 0, NULL, 0, section, sizeof(section), &section_len), WTQ_CONNECT_OK);
+    WTQ_TEST_CHECK_EQ_INT(wtq_h3_frame_encode_header(WTQ_H3_FRAME_HEADERS,
+        section_len, wire, sizeof(wire), &len), 0);
+    if (failures) goto cleanup;
+    memcpy(wire + len, section, section_len);
+    len += section_len;
+    struct wtq_dstream *connect = stream_budget_peer(drv, 9, 24, true, &failures);
+    if (!connect) goto cleanup;
+    WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(connect, wire, (uint32_t)len, false), len);
+    failures += stream_budget_no_shutdowns();
+    WTQ_TEST_CHECK_EQ_INT(g_pr.established, 0);
+    wtq_stream_budget_t b = WTQ_STREAM_BUDGET_INIT;
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(session, &b), WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(b.http_request_live, 7);
+    WTQ_TEST_CHECK_EQ_INT(b.peer_bidi_resident, 7);
+    const wtq_h3_settings_encode_cfg_t settings = { .enable_connect_protocol = true };
+    wire[0] = 0;
+    WTQ_TEST_CHECK_EQ_INT(wtq_h3_settings_encode_frame(&settings,
+        wire + 1, sizeof(wire) - 1, &len), WTQ_H3_SETTINGS_OK);
+    struct wtq_dstream *control = stream_budget_peer(drv, 0, 2, false, &failures);
+    if (!control || failures) goto cleanup;
+    WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(control, wire, (uint32_t)(len + 1), false), len + 1);
+    WTQ_TEST_CHECK_EQ_INT(g_pr.established, 1);
+    WTQ_TEST_CHECK_EQ_U64(wtq_conn_session_id(wtq_api_session_conn(session)), 24);
+    complete_all_sends();
+    for (unsigned i = 0; i < 16; ++i) {
+        wtq_stream_t *st = NULL;
+        WTQ_TEST_CHECK_EQ_INT(i & 1 ? wtq_session_open_bidi(session, &st) :
+            wtq_session_open_uni(session, &st), WTQ_OK);
+        WTQ_TEST_CHECK(st != NULL);
+    }
+    complete_all_sends();
+    unsigned opens = g_native_opens, starts = g_native_starts;
+    wtq_stream_t *extra = NULL;
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_open_uni(session, &extra), WTQ_ERR_WOULD_BLOCK);
+    WTQ_TEST_CHECK(extra == NULL);
+    WTQ_TEST_CHECK_EQ_INT(g_native_opens, opens);
+    WTQ_TEST_CHECK_EQ_INT(g_native_starts, starts);
+    size_t attempts = lifetime.attempts, frees = lifetime.free_calls;
+    /* Both late critical peers still have independent reserved positions. */
+    for (unsigned i = 1; i < 3 && !failures; ++i) {
+        struct wtq_dstream *ds = stream_budget_peer(drv, i, 2 + 4u * i, false, &failures);
+        if (!ds) goto cleanup;
+        const uint8_t type = (uint8_t)(i + 1);
+        WTQ_TEST_CHECK_EQ_U64(recv_deliver_bytes(ds, &type, 1, false), 1);
+        WTQ_TEST_CHECK(ds->ectx != NULL);
+        failures += stream_budget_no_shutdowns();
+    }
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(session, &b), WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(b.engine_capacity, 26);
+    WTQ_TEST_CHECK_EQ_INT(b.api_capacity, 26);
+    WTQ_TEST_CHECK_EQ_INT(b.native_capacity, 29);
+    WTQ_TEST_CHECK_EQ_INT(b.peer_uni_resident, 3);
+    WTQ_TEST_CHECK_EQ_INT(b.peer_bidi_resident, 7);
+    WTQ_TEST_CHECK_EQ_INT(b.local_resident, 16);
+    WTQ_TEST_CHECK_EQ_INT(b.local_wt_live, 16);
+    WTQ_TEST_CHECK_EQ_INT(b.http_request_live, 7);
+    WTQ_TEST_CHECK_EQ_INT(b.http_critical_live, 3);
+    WTQ_TEST_CHECK_EQ_INT(b.peer_wt_live + b.peer_wt_waiting + b.api_retained_terminal, 0);
+    WTQ_TEST_CHECK_EQ_INT(b.peer_high_water, 10);
+    WTQ_TEST_CHECK_EQ_INT(b.local_high_water, 16);
+    WTQ_TEST_CHECK_EQ_U64(b.local_open_blocked, 1);
+    WTQ_TEST_CHECK_EQ_SIZE(stream_record_count(drv), 29);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.attempts, attempts);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.free_calls, frees);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.live, 5);
+    WTQ_TEST_CHECK_EQ_INT(lifetime.closes + g_conn_shutdowns + g_term_fired + g_pr.opened, 0);
+cleanup:
+    complete_all_sends();
+    wtq_api_session_admission_detach(session);
+    wtq_session_release(session);
+    drv->session = NULL; drv->conn = NULL;
+    wtq_msq_conn_free(drv);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.live, 0);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.allocations, lifetime.free_calls);
+    WTQ_TEST_CHECK_EQ_SIZE(lifetime.allocated_bytes, lifetime.freed_bytes);
+    return failures;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--stream-budget-control") == 0)
+        return test_stream_budget_progress(false);
+    if (argc == 2 && strcmp(argv[1], "--stream-budget-progress") == 0)
+        return test_stream_budget_progress(true);
+    if (argc == 2 && strcmp(argv[1], "--stream-budget-contract") == 0)
+        return test_stream_budget_plan_and_oom() + test_stream_budget_allocation_delta() +
+            test_stream_budget_waiting_peer_local_open() + test_stream_budget_configured_query() +
+            test_stream_budget_established_barrier() + test_stream_budget_index_and_retirement() +
+            test_stream_budget_late_http() + test_bounded_final_shutdown();
     if (argc == 2 && strcmp(argv[1], "--send-commit") == 0)
         return test_send_commit_dispatch();
     if (argc == 2 && strcmp(argv[1], "--abort-terminal") == 0)
@@ -3527,6 +4799,15 @@ int main(int argc, char **argv)
     failures += test_recv_fin_deferred_while_paused();
     failures += test_settings_non_multi_receive();
     if (!baseline) {
+        failures += test_stream_budget_progress(false);
+        failures += test_stream_budget_progress(true);
+        failures += test_stream_budget_plan_and_oom();
+        failures += test_stream_budget_allocation_delta();
+        failures += test_stream_budget_waiting_peer_local_open();
+        failures += test_stream_budget_configured_query();
+        failures += test_stream_budget_established_barrier();
+        failures += test_stream_budget_index_and_retirement();
+        failures += test_stream_budget_late_http();
         failures += test_abort_shutdown_completion();
         failures += test_abort_pooled_shutdown_credit();
         failures += test_terminal_callback_reentrancy();

@@ -47,13 +47,24 @@ struct rig {
     unsigned last_return_sequence, last_commit_sequence, last_terminal_sequence;
     void *last_return_cookie;
     wtq_stream_t *last_terminal;
+    /* native stream records allocated (sizeof(struct wtq_dstream) requests) */
+    unsigned record_allocations, replacement_record_allocations;
+    wtq_result_t replacement_open;
+    /* budgeted isolation, observed inside the reentrant callback after the
+     * nested reset and before the replacement opens */
+    struct wtq_dstream *old_ds;
+    uint32_t old_index;
+    bool iso_observed, iso_occupied, iso_shutdown, iso_detached, iso_available;
 };
 
 static void *allocate(size_t size, void *ctx)
 {
     struct rig *r = ctx;
     void *p = malloc(size);
-    if (p) { r->allocations++; r->live++; }
+    if (p) {
+        r->allocations++; r->live++;
+        if (size == sizeof(struct wtq_dstream)) r->record_allocations++;
+    }
     return p;
 }
 
@@ -231,10 +242,21 @@ static void returned(wtq_session_t *s, void *cookie, bool canceled, void *ctx)
         r->refuse = r->shutdown_inline = false;
         if (wtq_stream_reset(st, 43) != WTQ_OK) r->errors++;
         if (wtq_session_local_flush(s) != WTQ_ERR_WOULD_BLOCK) r->errors++;
+        if (r->old_ds) {
+            r->iso_observed = true;
+            r->iso_occupied = r->old_ds->occupied;
+            r->iso_shutdown = r->old_ds->shutdown_complete;
+            r->iso_detached = r->old_ds->ectx == NULL;
+            r->iso_available = wtq_conn_stream_available_v2(
+                wtq_api_session_conn(s), r->old_index);
+        }
         if (r->replace_after_reset) {
             static const uint8_t byte = 17;
             wtq_span_t span = { .data = &byte, .len = 1 };
-            if (wtq_session_open_uni(s, &r->replacement) != WTQ_OK) r->errors++;
+            unsigned records = r->record_allocations;
+            r->replacement_open = wtq_session_open_uni(s, &r->replacement);
+            r->replacement_record_allocations = r->record_allocations - records;
+            if (r->replacement_open != WTQ_OK) r->errors++;
             r->replacement_ds = r->drv->streams;
             r->replacement_es = r->replacement_ds->ectx;
             r->replacement_generation = wtq_estream_generation_v1(r->replacement_es);
@@ -316,7 +338,22 @@ static void complete_all(struct rig *r)
     r->sent = r->completed = 0;
 }
 
-static int setup(struct rig *r, bool buffered, bool bounded)
+/* Read-only observer of the real driver's flush state for the legacy rig:
+ * the same driver counters the MsQuic backend's own probe reads. */
+static wtq_result_t legacy_flush_probe(const void *ctx)
+{
+    const struct wtq_driver *drv = ctx;
+    if (drv->flush_failed) return WTQ_ERR_BACKEND;
+    if (drv->shutdown_started) return WTQ_ERR_CLOSED;
+    return wtq_msq_flush_pending(drv) ? WTQ_ERR_WOULD_BLOCK : WTQ_OK;
+}
+
+/* legacy: an unqualified accounted session (no stream budget, per-stream
+ * native records, legacy engine slot reuse) with acknowledged local flush
+ * registered over the real driver, and the legacy peer-control bootstrap.
+ * Otherwise the budgeted MsQuic session the backend creates. */
+static int setup_mode(struct rig *r, bool buffered, bool default_budget,
+                      bool legacy)
 {
     memset(r, 0, sizeof(*r));
     if (pthread_mutex_init(&r->lane, NULL) != 0) return 1;
@@ -339,12 +376,19 @@ static int setup(struct rig *r, bool buffered, bool bounded)
     wtq_api_session_cfg_t cfg = { .alloc = &r->alloc,
         .perspective = WTQ_PERSPECTIVE_CLIENT, .events = &ev, .user = r,
         .drv = r->drv, .ops = wtq_msq_driver_ops() };
-    wtq_msquic_tuning_t t;
-    wtq_msquic_tuning_init(&t);
-    t.send_buffering = buffered;
-    if (!bounded) t.peer_unidi_stream_count++;
-    if (wtq_msq_session_create_bounded(r->drv, &cfg, &t, &r->session) != WTQ_OK)
-        return 1;
+    if (legacy) {
+        if (wtq_api_session_create_accounted(&cfg, &r->session) != WTQ_OK ||
+            wtq_api_session_set_local_flush(r->session, WTQ_LOCAL_FLUSH_ACKNOWLEDGED,
+                legacy_flush_probe, r->drv) != WTQ_OK || r->drv->bounded_admission)
+            return 1;
+    } else {
+        wtq_msquic_tuning_t t;
+        wtq_msquic_tuning_init(&t);
+        t.send_buffering = buffered;
+        if (!default_budget) t.peer_unidi_stream_count++;
+        if (wtq_msq_session_create_bounded(r->drv, &cfg, &t, &r->session) != WTQ_OK)
+            return 1;
+    }
     r->drv->session = r->session;
     if (wtq_session_local_flush(r->session) != WTQ_ERR_STATE) return 1;
     QUIC_CONNECTION_EVENT connected = { .Type = QUIC_CONNECTION_EVENT_CONNECTED };
@@ -358,18 +402,24 @@ static int setup(struct rig *r, bool buffered, bool bounded)
     if (wtq_h3_settings_encode_frame(&sc, settings + 1, sizeof(settings) - 1, &n))
         return 1;
     struct wtq_dstream *peer = wtq_msq_stream_new(r->drv, false, false, 3);
+    if (!peer) return 1;
     wtq_conn_t *conn = wtq_api_session_conn(r->session);
     wtq_api_session_enter(r->session);
-    if (bounded) {
-        (void)wtq_conn_peer_admission_init(conn, &peer->admission, peer, 3,
-            false, (unsigned)(peer - r->drv->peers));
-        size_t consumed = 0;
-        (void)wtq_msq_stream_input(peer, settings, n + 1, false, &consumed);
+    wtq_result_t rc;
+    size_t consumed = 0;
+    if (legacy) {
+        rc = wtq_conn_on_peer_uni_opened(conn, peer, 3, &peer->ectx);
+        if (rc == WTQ_OK)
+            (void)wtq_conn_on_stream_bytes(conn, peer->ectx, settings, n + 1, false, 1);
+        consumed = n + 1; /* establishment below proves the SETTINGS were taken */
     } else {
-        (void)wtq_conn_on_peer_uni_opened(conn, peer, 3, &peer->ectx);
-        (void)wtq_conn_on_stream_bytes(conn, peer->ectx, settings, n + 1, false, 1);
+        rc = wtq_conn_peer_admission_init_v2(conn, &peer->admission,
+            peer, 3, false, peer->slot);
+        if (rc == WTQ_OK)
+            rc = wtq_msq_stream_input(peer, settings, n + 1, false, &consumed);
     }
     wtq_msq_conn_leave_and_poll(r->drv);
+    if (rc != WTQ_OK || consumed != n + 1) return 1;
     if (wtq_connect_encode_response(200, NULL, section, sizeof(section), &sn) ||
         wtq_h3_frame_encode_header(WTQ_H3_FRAME_HEADERS, sn, response,
             sizeof(response), &hn)) return 1;
@@ -381,6 +431,11 @@ static int setup(struct rig *r, bool buffered, bool bounded)
     (void)wtq_conn_on_stream_bytes(conn, bidi->ectx, response, hn + sn, false, 2);
     wtq_msq_conn_leave_and_poll(r->drv);
     return wtq_session_status(r->session) != WTQ_SESSION_STATUS_ESTABLISHED;
+}
+
+static int setup(struct rig *r, bool buffered, bool default_budget)
+{
+    return setup_mode(r, buffered, default_budget, false);
 }
 
 static int teardown(struct rig *r)
@@ -515,6 +570,99 @@ static int test_transaction_generation(bool retain_old, bool send_entry)
     struct wtq_dstream *ds = r.drv->streams;
     wtq_estream_t *old_es = ds->ectx;
     uint64_t old_generation = wtq_estream_generation_v1(old_es);
+    wtq_conn_t *conn = wtq_api_session_conn(r.session);
+    uint32_t old_index = wtq_conn_stream_index_v2(conn, old_es);
+    WTQ_TEST_CHECK_EQ_INT(old_index, ds->slot);
+    r.original_id = wtq_stream_id(old);
+    complete_all(&r);
+    if (retain_old) wtq_stream_add_ref(old);
+    WTQ_TEST_CHECK_EQ_INT(wtq_stream_enable_send_commit(old), WTQ_OK);
+    static const uint8_t byte = 23;
+    wtq_span_t span = { .data = &byte, .len = 1 };
+    if (!send_entry)
+        WTQ_TEST_CHECK_EQ_INT(wtq_stream_send(old, &span, 1, WTQ_SEND_FIN, &r), WTQ_OK);
+    r.old_ds = ds;
+    r.old_index = old_index;
+    r.nested_reset = old;
+    r.replace_after_reset = true;
+    r.check_return = true; r.return_result = WTQ_ERR_WOULD_BLOCK;
+    if (send_entry) {
+        r.sync_complete = true;
+        WTQ_TEST_CHECK_EQ_INT(wtq_stream_send(old, &span, 1, WTQ_SEND_FIN, &r), WTQ_OK);
+    } else {
+        r.shutdown_inline = r.shutdown_borrow = r.shutdown_query = true;
+        WTQ_TEST_CHECK_EQ_INT(wtq_stream_reset(old, 42), WTQ_OK);
+    }
+    /* No caller access to the baseline-only old handle after its terminal. */
+    r.shutdown_inline = r.shutdown_query = false;
+    WTQ_TEST_CHECK(r.replacement != NULL);
+    if (retain_old) WTQ_TEST_CHECK(r.replacement != old);
+    WTQ_TEST_CHECK_EQ_INT(r.original_closures, 1);
+    WTQ_TEST_CHECK_EQ_INT(r.replacement_closures, 0);
+    WTQ_TEST_CHECK(r.replacement_ds != ds);
+    /* Budgeted isolation: inside the reentrant callback the old native record
+     * is still occupied, not natively shut down and detached from the engine,
+     * and its engine reservation is unavailable, so the replacement takes
+     * another engine/native position without allocating a native record. */
+    WTQ_TEST_CHECK(r.iso_observed);
+    WTQ_TEST_CHECK(r.iso_occupied && !r.iso_shutdown && r.iso_detached);
+    WTQ_TEST_CHECK(!r.iso_available);
+    WTQ_TEST_CHECK_EQ_INT(r.replacement_open, WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(r.replacement_record_allocations, 0);
+    WTQ_TEST_CHECK(r.replacement_es != old_es);
+    WTQ_TEST_CHECK(r.replacement_ds->slot != ds->slot);
+    WTQ_TEST_CHECK_EQ_INT(wtq_conn_stream_index_v2(conn, r.replacement_es),
+        r.replacement_ds->slot);
+    WTQ_TEST_CHECK(r.replacement_generation > old_generation);
+    /* After the outer call the old reservation is still owned by the old
+     * native record: its engine identity is unchanged and not reusable. */
+    WTQ_TEST_CHECK_EQ_U64(wtq_estream_generation_v1(old_es), old_generation);
+    WTQ_TEST_CHECK(ds->occupied && ds->ectx == NULL && ds->slot == old_index);
+    WTQ_TEST_CHECK(!wtq_conn_stream_available_v2(conn, old_index));
+    WTQ_TEST_CHECK(r.replacement_ds->ectx == r.replacement_es);
+    WTQ_TEST_CHECK(wtq_estream_is_wt_data_v1(r.replacement_es, r.replacement_ds));
+    WTQ_TEST_CHECK_EQ_SIZE(wtq_estream_generation_v1(r.replacement_es), r.replacement_generation);
+    WTQ_TEST_CHECK_EQ_SIZE(wtq_stream_id(r.replacement), r.replacement_id);
+    WTQ_TEST_CHECK(wtq_estream_driver_stream(r.replacement_es) == r.replacement_ds);
+    WTQ_TEST_CHECK_EQ_INT(wtq_stream_send(r.replacement, &span, 1, WTQ_SEND_FIN, &r), WTQ_OK);
+    failures += passive(&r, WTQ_ERR_WOULD_BLOCK);
+    complete_all(&r); /* replacement bytes returned, replacement FIN still owed */
+    failures += passive(&r, WTQ_ERR_WOULD_BLOCK);
+    WTQ_TEST_CHECK_EQ_INT(r.commits, 0);
+    event(ds, QUIC_STREAM_EVENT_SEND_SHUTDOWN_COMPLETE, !send_entry); /* old late event */
+    WTQ_TEST_CHECK_EQ_INT(r.commits, 0);
+    failures += passive(&r, WTQ_ERR_WOULD_BLOCK); /* only replacement FIN remains */
+    event(r.replacement_ds, QUIC_STREAM_EVENT_SEND_SHUTDOWN_COMPLETE, true);
+    failures += passive(&r, WTQ_OK);
+    WTQ_TEST_CHECK_EQ_INT(r.commits, 1);
+    WTQ_TEST_CHECK(r.last_committed == r.replacement);
+    WTQ_TEST_CHECK_EQ_INT(r.replacement_closures, 1);
+    WTQ_TEST_CHECK_EQ_INT(r.original_closures, 1);
+    if (retain_old) wtq_stream_release(old);
+    failures += teardown(&r);
+    WTQ_TEST_CHECK_EQ_SIZE(r.live, 0);
+    return failures;
+}
+
+/* The same four transactions on the unqualified legacy core path, where an
+ * engine slot released by the nested reset is immediately reusable while the
+ * old native record and the held API record survive separately. The
+ * prerequisites (captured inside the callback) prove the reentrant
+ * replacement took the SAME engine address with a new generation and a
+ * different, newly allocated native record; the outcome checks then prove
+ * the outer transaction's post-call guards left that replacement intact.
+ * "baseline" selectors mean no app retain, not a legacy provider. */
+static int test_transaction_generation_legacy(bool retain_old, bool send_entry)
+{
+    int failures = 0;
+    struct rig r;
+    WTQ_TEST_CHECK_EQ_INT(setup_mode(&r, false, true, true), 0);
+    complete_all(&r);
+    wtq_stream_t *old = NULL;
+    WTQ_TEST_CHECK_EQ_INT(wtq_session_open_uni(r.session, &old), WTQ_OK);
+    struct wtq_dstream *ds = r.drv->streams;
+    wtq_estream_t *old_es = ds->ectx;
+    uint64_t old_generation = wtq_estream_generation_v1(old_es);
     r.original_id = wtq_stream_id(old);
     complete_all(&r);
     if (retain_old) wtq_stream_add_ref(old);
@@ -535,13 +683,17 @@ static int test_transaction_generation(bool retain_old, bool send_entry)
     }
     /* No caller access to the baseline-only old handle after its terminal. */
     r.shutdown_inline = r.shutdown_query = false;
+    /* Prerequisites, captured inside the reentrant callback. */
     WTQ_TEST_CHECK(r.replacement != NULL);
+    WTQ_TEST_CHECK_EQ_INT(r.replacement_open, WTQ_OK);
     if (retain_old) WTQ_TEST_CHECK(r.replacement != old);
     WTQ_TEST_CHECK_EQ_INT(r.original_closures, 1);
-    WTQ_TEST_CHECK_EQ_INT(r.replacement_closures, 0);
-    WTQ_TEST_CHECK(r.replacement_ds != ds);
-    WTQ_TEST_CHECK(r.replacement_es == old_es); /* causal engine-slot reuse */
+    WTQ_TEST_CHECK(r.replacement_es == old_es); /* same engine address */
     WTQ_TEST_CHECK(r.replacement_generation > old_generation);
+    WTQ_TEST_CHECK(r.replacement_ds != ds); /* different native record */
+    WTQ_TEST_CHECK_EQ_INT(r.replacement_record_allocations, 1);
+    /* Outcome: the outer call's post-call state did not touch the reused slot. */
+    WTQ_TEST_CHECK_EQ_INT(r.replacement_closures, 0);
     WTQ_TEST_CHECK(r.replacement_ds->ectx == r.replacement_es);
     WTQ_TEST_CHECK(wtq_estream_is_wt_data_v1(r.replacement_es, r.replacement_ds));
     WTQ_TEST_CHECK_EQ_SIZE(wtq_estream_generation_v1(r.replacement_es), r.replacement_generation);
@@ -827,8 +979,11 @@ static int test_refusal_and_controls(void)
         WTQ_TEST_CHECK_EQ_INT(wtq_session_local_flush_mode(r.session),
             buffered ? WTQ_LOCAL_FLUSH_UNSUPPORTED : WTQ_LOCAL_FLUSH_ACKNOWLEDGED);
         complete_all(&r);
-        struct wtq_dstream *ds = wtq_msq_stream_new(r.drv, true, true, 100);
-        ds->stream = (HQUIC)(void *)ds;
+        wtq_stream_t *st = NULL;
+        WTQ_TEST_CHECK_EQ_INT(wtq_session_open_bidi(r.session, &st), WTQ_OK);
+        WTQ_TEST_CHECK(st != NULL);
+        struct wtq_dstream *ds = r.drv->streams;
+        complete_all(&r); /* return the WT preamble before the flush probe */
         wtq_result_t want = buffered ? WTQ_ERR_UNSUPPORTED : WTQ_OK;
         WTQ_TEST_CHECK_EQ_INT(wtq_msq_driver_ops()->send_gather(r.drv, ds, NULL, 0, false, NULL), WTQ_OK);
         failures += passive(&r, want); /* empty record owes borrow return, not output */
@@ -1144,7 +1299,11 @@ static int test_effective_client_settings(void)
         WTQ_TEST_CHECK_EQ_INT(r.configured.SendBufferingEnabled, row == 2);
         WTQ_TEST_CHECK_EQ_INT(wtq_session_local_flush_mode(r.session),
             row == 2 ? WTQ_LOCAL_FLUSH_UNSUPPORTED : WTQ_LOCAL_FLUSH_ACKNOWLEDGED);
-        WTQ_TEST_CHECK_EQ_INT(r.drv->bounded_admission, row != 3);
+        WTQ_TEST_CHECK(r.drv->bounded_admission);
+        wtq_stream_budget_t budget = WTQ_STREAM_BUDGET_INIT;
+        WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(r.session, &budget), WTQ_OK);
+        WTQ_TEST_CHECK_EQ_INT(budget.peer_unidi_stream_count, 8);
+        WTQ_TEST_CHECK_EQ_INT(budget.peer_bidi_stream_count, row == 3 ? 8 : 7);
         QUIC_CONNECTION_EVENT done = { .Type = QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE };
         (void)wtq_msq_conn_callback(r.drv->conn, r.drv, &done);
         wtq_session_release(r.session);
@@ -1317,6 +1476,14 @@ int main(int argc, char **argv)
         return test_transaction_generation(true, true) ? 1 : 0;
     if (argc == 2 && strcmp(argv[1], "--send-generation-baseline") == 0)
         return test_transaction_generation(false, true) ? 1 : 0;
+    if (argc == 2 && strcmp(argv[1], "--legacy-generation-retained") == 0)
+        return test_transaction_generation_legacy(true, false) ? 1 : 0;
+    if (argc == 2 && strcmp(argv[1], "--legacy-generation-baseline") == 0)
+        return test_transaction_generation_legacy(false, false) ? 1 : 0;
+    if (argc == 2 && strcmp(argv[1], "--legacy-send-generation-retained") == 0)
+        return test_transaction_generation_legacy(true, true) ? 1 : 0;
+    if (argc == 2 && strcmp(argv[1], "--legacy-send-generation-baseline") == 0)
+        return test_transaction_generation_legacy(false, true) ? 1 : 0;
     if (argc == 2 && strcmp(argv[1], "--terminal-cache") == 0)
         return test_direct_terminal_loss_cache() ? 1 : 0;
     int failures = test_canceled_commit_contract() + test_success() + test_loss() + test_refusal_and_controls() +
@@ -1324,6 +1491,10 @@ int main(int argc, char **argv)
         test_intent_terminal_and_isolation() +
         test_transaction_generation(true, false) + test_transaction_generation(false, false) +
         test_transaction_generation(true, true) + test_transaction_generation(false, true) +
+        test_transaction_generation_legacy(true, false) +
+        test_transaction_generation_legacy(false, false) +
+        test_transaction_generation_legacy(true, true) +
+        test_transaction_generation_legacy(false, true) +
         test_direct_terminal_loss_cache() +
         test_inline_and_domain() + test_effective_client_settings() +
         test_half_abort_and_datagram() + test_resident_reuse_and_blocked() +

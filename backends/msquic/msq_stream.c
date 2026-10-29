@@ -7,10 +7,10 @@
  * until resume. Otherwise MsQuic's own flow-control windows are the only
  * inbound throttle.
  *
- * Qualified peer streams delay native StreamClose/stream-ID credit until
+ * Qualified streams delay native StreamClose/stream-ID credit until
  * transport shutdown, engine detach, send completion and API lease release.
  * Their preallocated records retire only at a safe admission/dispatch root.
- * Legacy/local native handles close at SHUTDOWN_COMPLETE; their metadata
+ * Legacy native handles close at SHUTDOWN_COMPLETE; their metadata
  * likewise survives outstanding engine, API and send borrows.
  */
 
@@ -20,26 +20,29 @@
 
 #include "proto/h3_err.h"
 
-struct wtq_dstream *wtq_msq_stream_new(struct wtq_driver *drv,
-                                       bool is_local, bool is_bidi,
-                                       uint64_t id)
+static void stream_residency(struct wtq_driver *drv, uint32_t slot, bool acquire)
 {
-    struct wtq_dstream *ds = NULL;
-    if (drv->bounded_admission && !is_local) {
-        size_t first = is_bidi ? 8u : 0u;
-        size_t end = is_bidi ? 15u : 8u;
-        for (size_t i = first; i < end; ++i) {
-            if (!drv->peers[i].occupied) { ds = &drv->peers[i]; break; }
-        }
-    } else {
-        ds = drv->alloc.alloc(sizeof(*ds), drv->alloc.ctx);
-    }
+    wtq_stream_budget_t *b = &drv->budget;
+    uint32_t peers = b->peer_unidi_stream_count + b->peer_bidi_stream_count;
+    uint32_t *resident = slot < b->peer_unidi_stream_count ? &b->peer_uni_resident :
+        slot < peers ? &b->peer_bidi_resident :
+        slot < b->api_capacity ? &b->local_resident : NULL;
+    if (!resident) return;
+    if (acquire) ++*resident;
+    else --*resident;
+    uint32_t peer_live = b->peer_uni_resident + b->peer_bidi_resident;
+    if (peer_live > b->peer_high_water) b->peer_high_water = peer_live;
+    if (b->local_resident > b->local_high_water) b->local_high_water = b->local_resident;
+}
 
-    if (ds == NULL)
-        return NULL;
+static struct wtq_dstream *stream_initialize(struct wtq_driver *drv,
+    struct wtq_dstream *ds, uint32_t slot, bool is_local, bool is_bidi, uint64_t id)
+{
     memset(ds, 0, sizeof(*ds));
+    ds->slot = slot;
+    ds->admission.struct_size = sizeof(ds->admission);
     ds->occupied = true;
-    ds->pooled = drv->bounded_admission && !is_local;
+    ds->pooled = drv->bounded_admission;
     ds->generation = ++drv->peer_generation;
     ds->drv = drv;
     ds->id = id;
@@ -47,7 +50,41 @@ struct wtq_dstream *wtq_msq_stream_new(struct wtq_driver *drv,
     ds->is_bidi = is_bidi;
     ds->next = drv->streams;
     drv->streams = ds;
+    if (ds->pooled) stream_residency(drv, slot, true);
     return ds;
+}
+
+struct wtq_dstream *wtq_msq_stream_reserve(struct wtq_driver *drv,
+    uint32_t slot, bool local, bool bidi, uint64_t id)
+{
+    if (!drv->bounded_admission || slot >= drv->budget.native_capacity ||
+        drv->peers[slot].occupied) return NULL;
+    return stream_initialize(drv, &drv->peers[slot], slot, local, bidi, id);
+}
+
+void wtq_msq_stream_unreserve(struct wtq_driver *drv, struct wtq_dstream *ds)
+{
+    if (ds->pooled) {
+        stream_residency(drv, ds->slot, false);
+        ds->occupied = false;
+    } else drv->alloc.free(ds, sizeof(*ds), drv->alloc.ctx);
+}
+
+struct wtq_dstream *wtq_msq_stream_new(struct wtq_driver *drv,
+    bool is_local, bool is_bidi, uint64_t id)
+{
+    if (drv->bounded_admission) {
+        if (is_local) return NULL; /* engine-indexed reservation via op_open */
+        uint32_t first = is_bidi ? drv->budget.peer_unidi_stream_count : 0;
+        uint32_t end = drv->budget.peer_unidi_stream_count +
+            (is_bidi ? drv->budget.peer_bidi_stream_count : 0);
+        for (uint32_t i = first; i < end; ++i)
+            if (!drv->peers[i].occupied)
+                return wtq_msq_stream_reserve(drv, i, false, is_bidi, id);
+        return NULL;
+    }
+    struct wtq_dstream *ds = drv->alloc.alloc(sizeof(*ds), drv->alloc.ctx);
+    return ds ? stream_initialize(drv, ds, UINT32_MAX, is_local, is_bidi, id) : NULL;
 }
 
 static void admission_remove(struct wtq_driver *drv, struct wtq_dstream *ds)
@@ -106,6 +143,10 @@ static void stream_complete_terminals(struct wtq_driver *drv)
                 false, wtq_msq_now_us());
             break;
         }
+        if (!ds->ectx && ds->admission.prefix.state != 1) {
+            ds->terminal_pending = false;
+            ds->admission_stop_pending = ds->admission_reset_pending = false;
+        }
         if (!ds->ectx || ds->fin_pending ||
             ds->recv_held_data)
             continue;
@@ -125,8 +166,11 @@ static void stream_collect(struct wtq_driver *drv,
     while (*link != NULL) {
         struct wtq_dstream *ds = *link;
         if (ds != borrowed && ds->shutdown_complete && ds->ectx == NULL &&
-            ds->admission.es == NULL && ds->admission.state != 1 &&
-            !ds->credit_held && ds->send_refs == 0) {
+            ds->admission.prefix.es == NULL && ds->admission.prefix.state != 1 &&
+            !ds->credit_held && ds->send_refs == 0 && !ds->terminal_pending &&
+            !ds->fin_pending && !ds->recv_held_data &&
+            !ds->admission_stop_pending && !ds->admission_reset_pending &&
+            !ds->flush_decision && !ds->flush_shutdown_pending) {
             if (ds->flush_settling) {
                 wtq_msq_flush_fail(drv); /* retired without abort evidence */
                 ds->flush_settling = false;
@@ -134,9 +178,11 @@ static void stream_collect(struct wtq_driver *drv,
             }
             *link = ds->next;
             if (ds->pooled) admission_remove(drv, ds);
-            if (ds->pooled && drv->session)
-                wtq_conn_peer_admission_forget(wtq_api_session_conn(drv->session),
-                    &ds->admission);
+            if (ds->pooled && drv->session) {
+                wtq_conn_t *conn = wtq_api_session_conn(drv->session);
+                if (!ds->is_local) wtq_conn_peer_admission_forget_v2(conn, &ds->admission);
+                wtq_conn_stream_retire_v2(conn, ds->slot, ds);
+            }
             HQUIC handle = ds->stream;
             ds->stream = NULL;
             if (handle) {
@@ -144,8 +190,7 @@ static void stream_collect(struct wtq_driver *drv,
                 drv->api->StreamClose(handle);
                 drv->api_depth--;
             }
-            if (ds->pooled) ds->occupied = false;
-            else drv->alloc.free(ds, sizeof(*ds), drv->alloc.ctx);
+            wtq_msq_stream_unreserve(drv, ds);
         } else {
             link = &ds->next;
         }
@@ -167,12 +212,12 @@ wtq_result_t wtq_msq_stream_input(struct wtq_dstream *ds,
 {
     wtq_conn_t *conn = wtq_api_session_conn(ds->drv->session);
     wtq_result_t rc;
-    if (ds->pooled) {
-        bool was_waiting = ds->admission.state == 1;
-        rc = wtq_conn_peer_admission_bytes(conn, &ds->admission,
+    if (wtq_msq_peer_record(ds)) {
+        bool was_waiting = ds->admission.prefix.state == 1;
+        rc = wtq_conn_peer_admission_bytes_v2(conn, &ds->admission,
             data, len, fin, wtq_msq_now_us(), consumed);
-        ds->ectx = ds->admission.es;
-        if (!was_waiting && ds->admission.state == 1) {
+        ds->ectx = ds->admission.prefix.es;
+        if (!was_waiting && ds->admission.prefix.state == 1) {
             /* Ready-prefix order is independent of direction and recycled
              * pool indices. There is at most one node per peer record. */
             ds->admission_next = NULL;
@@ -195,7 +240,7 @@ static void stream_feed_fin(struct wtq_dstream *ds)
 {
     struct wtq_driver *drv = ds->drv;
 
-    if (ds->fin_delivered || (!ds->pooled && ds->ectx == NULL) || drv->session == NULL)
+    if (ds->fin_delivered || (!wtq_msq_peer_record(ds) && ds->ectx == NULL) || drv->session == NULL)
         return;
     wtq_api_session_enter(drv->session);
     size_t consumed = 0;
@@ -216,10 +261,11 @@ static wtq_result_t admission_service(wtq_driver_t *drv)
     if (drv->shutdown_started || atomic_load_explicit(&drv->sweeping,
             memory_order_acquire)) return WTQ_ERR_CLOSED;
     stream_collect(drv, drv->admission_borrowed);
-    struct { struct wtq_dstream *ds; uint64_t generation; } snapshot[15];
+    struct wtq_msq_admission_snapshot *snapshot = drv->admission_snapshot;
+    uint32_t peers = drv->budget.peer_unidi_stream_count + drv->budget.peer_bidi_stream_count;
     size_t count = 0;
     for (struct wtq_dstream *ds = drv->admission_head;
-         ds && count < 15; ds = ds->admission_next) {
+         ds && count < peers; ds = ds->admission_next) {
         snapshot[count].ds = ds;
         snapshot[count++].generation = ds->generation;
     }
@@ -228,9 +274,9 @@ static wtq_result_t admission_service(wtq_driver_t *drv)
         struct wtq_dstream *ds = snapshot[i].ds;
         if (!ds->occupied || ds->generation != snapshot[i].generation) continue;
         wtq_result_t rc;
-        if (ds->admission.state == 1) {
-            rc = wtq_api_session_admit(drv->session, &ds->admission);
-            ds->ectx = ds->admission.es;
+        if (ds->admission.prefix.state == 1) {
+            rc = wtq_api_session_admit_v2(drv->session, &ds->admission);
+            ds->ectx = ds->admission.prefix.es;
             if (rc == WTQ_ERR_WOULD_BLOCK) continue;
             if (rc != WTQ_OK) return rc;
             ds->admission_resume_pending = true;
@@ -261,6 +307,7 @@ static wtq_result_t admission_service(wtq_driver_t *drv)
             ds->ectx && !drv->shutdown_started) {
             rc = wtq_msq_driver_ops()->recv_enable(drv, ds, true);
             if (rc != WTQ_OK) {
+                wtq_counter_increment(&drv->budget.admission_resume_failures);
                 if (result == WTQ_OK) result = rc;
                 continue; /* retain one retry obligation, never reopen */
             }
@@ -279,21 +326,48 @@ static wtq_result_t local_flush_probe(const void *ctx)
     return wtq_msq_flush_pending(drv) ? WTQ_ERR_WOULD_BLOCK : WTQ_OK;
 }
 
+wtq_result_t wtq_msq_stream_plan(const wtq_msquic_tuning_t *tuning,
+    uint32_t local, bool client, wtq_stream_plan_v1_t *out)
+{
+    if (!tuning) return WTQ_ERR_INVALID_ARG;
+    QUIC_SETTINGS settings;
+    wtq_msq_settings_init(&settings, tuning);
+    return wtq_api_stream_plan_v1(settings.PeerUnidiStreamCount,
+        settings.PeerBidiStreamCount, local, client, sizeof(struct wtq_dstream),
+        sizeof(struct wtq_msq_admission_snapshot), out);
+}
+
 wtq_result_t wtq_msq_session_create_bounded(struct wtq_driver *drv,
     const wtq_api_session_cfg_t *cfg, const wtq_msquic_tuning_t *tuning,
     wtq_session_t **out)
 {
+    if (!out) return WTQ_ERR_INVALID_ARG;
+    *out = NULL;
+    if (!drv || !cfg || drv->peers || drv->streams) return WTQ_ERR_INVALID_ARG;
     QUIC_SETTINGS settings;
     wtq_msq_settings_init(&settings, tuning);
-    const wtq_api_admission_ops_t ops = {
-        .peer_uni = 8, .peer_bidi = 7,
+    wtq_stream_plan_v1_t plan = { .struct_size = sizeof(plan) };
+    wtq_result_t rc = wtq_msq_stream_plan(tuning, drv->max_local_streams,
+        drv->is_client, &plan);
+    if (rc != WTQ_OK) return rc;
+    drv->stream_plan = plan;
+    drv->budget = plan.budget;
+    drv->peers = drv->alloc.alloc(plan.native_bytes, drv->alloc.ctx);
+    if (!drv->peers) return WTQ_ERR_NOMEM;
+    memset(drv->peers, 0, plan.native_bytes);
+    drv->admission_snapshot = drv->alloc.alloc(plan.scratch_bytes, drv->alloc.ctx);
+    if (!drv->admission_snapshot) {
+        drv->alloc.free(drv->peers, plan.native_bytes, drv->alloc.ctx);
+        drv->peers = NULL;
+        return WTQ_ERR_NOMEM;
+    }
+    const wtq_api_admission_v2_t ops = {
+        .struct_size = sizeof(ops), .plan = &plan, .native_budget = &drv->budget,
         .service = admission_service, .lease = admission_lease,
     };
-    bool bounded = settings.PeerUnidiStreamCount == 8 && settings.PeerBidiStreamCount == 7;
-    wtq_result_t rc = bounded ? wtq_api_session_create_admission(cfg, &ops, out)
-                              : wtq_api_session_create_accounted(cfg, out);
-    if (rc != WTQ_OK) return rc;
-    drv->bounded_admission = bounded;
+    rc = wtq_api_session_create_admission_v2(cfg, &ops, out);
+    if (rc != WTQ_OK) goto fail;
+    drv->bounded_admission = true;
     /* Exactly the settings translation passed to ConfigurationOpen on both
      * client and listener paths. Buffered buffer-return cannot certify ACKs
      * for an open stream (MsQuic docs/Streams.md, Send Buffering). */
@@ -304,8 +378,15 @@ wtq_result_t wtq_msq_session_create_bounded(struct wtq_driver *drv,
             wtq_session_release(*out);
             *out = NULL;
             drv->bounded_admission = false;
+            goto fail;
         }
     }
+    return rc;
+fail:
+    drv->alloc.free(drv->admission_snapshot, plan.scratch_bytes, drv->alloc.ctx);
+    drv->alloc.free(drv->peers, plan.native_bytes, drv->alloc.ctx);
+    drv->admission_snapshot = NULL;
+    drv->peers = NULL;
     return rc;
 }
 
@@ -400,7 +481,7 @@ static QUIC_STATUS stream_dispatch(HQUIC stream, struct wtq_dstream *ds,
         }
 
         /* Feed the accepted prefix only; MsQuic owns the pending suffix. */
-        if ((!ds->pooled && ds->ectx == NULL) || drv->session == NULL)
+        if ((!wtq_msq_peer_record(ds) && ds->ectx == NULL) || drv->session == NULL)
             break; /* engine refused the stream: discard the bytes */
 
         wtq_estream_t *key = ds->ectx;
@@ -417,7 +498,7 @@ static QUIC_STATUS stream_dispatch(HQUIC stream, struct wtq_dstream *ds,
             uint64_t accepted = 0;
             uint64_t total = ev->RECEIVE.TotalBufferLength;
             for (uint32_t i = 0; i < ev->RECEIVE.BufferCount; i++) {
-                if ((!ds->pooled && ds->ectx != key) || drv->shutdown_started)
+                if ((!wtq_msq_peer_record(ds) && ds->ectx != key) || drv->shutdown_started)
                     break; /* retired: discard the remaining transport input */
                 if (ds->recv_disabled) {
                     ev->RECEIVE.TotalBufferLength = accepted;
@@ -456,7 +537,7 @@ static QUIC_STATUS stream_dispatch(HQUIC stream, struct wtq_dstream *ds,
          * if data is held for redelivery the FIN rides it on resume, so
          * only a shutdown with nothing held needs the backend to remember
          * the FIN and replay it on resume. */
-        if (ds->recv_disabled || (ds->pooled && ds->admission.state == 1)) {
+        if (ds->recv_disabled || (wtq_msq_peer_record(ds) && ds->admission.prefix.state == 1)) {
             if (!ds->recv_held_data)
                 ds->fin_pending = true;
             break;
@@ -473,11 +554,11 @@ static QUIC_STATUS stream_dispatch(HQUIC stream, struct wtq_dstream *ds,
         ds->fin_pending = false;
         /* A bidi send half may keep ectx alive after receive RESET. */
         ds->admission_resume_pending = false;
-        if (ds->pooled && ds->admission.es == NULL) {
-            if (ds->admission.state == 1) {
+        if (wtq_msq_peer_record(ds) && ds->admission.prefix.es == NULL) {
+            if (ds->admission.prefix.state == 1) {
                 ds->admission_reset_pending = true;
                 ds->admission_reset_error = ev->PEER_SEND_ABORTED.ErrorCode;
-            } else ds->admission.state = 3;
+            } else ds->admission.prefix.state = 3;
         }
         if (ds->ectx != NULL && drv->session != NULL) {
             wtq_api_session_enter(drv->session);
@@ -495,7 +576,7 @@ static QUIC_STATUS stream_dispatch(HQUIC stream, struct wtq_dstream *ds,
             ds->terminal_pending = true;
             break;
         }
-        if (ds->pooled && ds->ectx == NULL && !ds->admission_stop_pending) {
+        if (wtq_msq_peer_record(ds) && ds->ectx == NULL && !ds->admission_stop_pending) {
             ds->admission_stop_pending = true;
             ds->admission_stop_first = !ds->admission_reset_pending;
             ds->admission_stop_error = ev->PEER_RECEIVE_ABORTED.ErrorCode;
@@ -619,7 +700,7 @@ static QUIC_STATUS stream_dispatch(HQUIC stream, struct wtq_dstream *ds,
          * The record is only eligible after Close and this frame return. */
         HQUIC handle = ds->stream;
         ds->shutdown_complete = true;
-        if (!ev->SHUTDOWN_COMPLETE.ConnectionShutdown &&
+        if (drv->session != NULL && !ev->SHUTDOWN_COMPLETE.ConnectionShutdown &&
             !ev->SHUTDOWN_COMPLETE.AppCloseInProgress)
             ds->terminal_pending = true;
         if (!ds->pooled || ev->SHUTDOWN_COMPLETE.AppCloseInProgress)

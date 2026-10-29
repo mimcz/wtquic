@@ -26,7 +26,7 @@ static int test_tuning_defaults(void)
 
     WTQ_TEST_CHECK_EQ_SIZE(t.struct_size, sizeof(t));
     WTQ_TEST_CHECK(t.send_buffering == false);
-    /* bounded by the engine's fixed 16-slot peer pool */
+    /* Native peer credit defaults are independent of local backing. */
     WTQ_TEST_CHECK_EQ_INT(t.peer_unidi_stream_count, 8);
     WTQ_TEST_CHECK_EQ_INT(t.peer_bidi_stream_count, 7);
     WTQ_TEST_CHECK_EQ_U64(t.stream_recv_window, 16u * 1024u * 1024u);

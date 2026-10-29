@@ -111,7 +111,7 @@ static bool sparse_ready(const struct side *s)
 {
     for (size_t i = 8; i < 15; ++i)
         if (s->driver->peers[i].occupied && s->driver->peers[i].id == 24 &&
-            s->driver->peers[i].admission.es != NULL) return true;
+            s->driver->peers[i].admission.prefix.es != NULL) return true;
     return false;
 }
 
@@ -217,7 +217,7 @@ int main(int argc, char **argv)
         for (size_t i = 8; i < 15; ++i) {
             const struct wtq_dstream *ds = &server.driver->peers[i];
             WTQ_TEST_CHECK(ds->occupied && ds->admission.reservation == i);
-            if (ds->admission.es == NULL) incomplete++;
+            if (ds->admission.prefix.es == NULL) incomplete++;
             else requests++;
         }
         WTQ_TEST_CHECK_EQ_INT(incomplete, 5);

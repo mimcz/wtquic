@@ -33,6 +33,7 @@ int main(void)
      * compiling no-op under pedantic C. */
     wtq_msquic_client_cfg_init(&ccfg);
     wtq_msquic_listener_cfg_init(&lcfg);
+    if (ccfg.max_local_streams != 0 || lcfg.max_local_streams != 0) return 1;
     lcfg.path_stride = sizeof(wtq_serve_config_t);
     wtq_msquic_client_cfg_init(NULL);
     wtq_msquic_listener_cfg_init(NULL);

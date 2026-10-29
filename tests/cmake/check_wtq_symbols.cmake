@@ -30,6 +30,7 @@ set(ALLOWED_SYMBOLS
     wtq_session_release
     wtq_session_receive_contract
     wtq_session_service_stream_admission
+    wtq_session_stream_budget
     wtq_session_close
     wtq_session_drain
     wtq_session_open_uni
@@ -67,6 +68,14 @@ set(ALLOWED_SYMBOLS
     wtq_api_session_create
     wtq_api_session_create_accounted
     wtq_api_session_create_admission
+    wtq_api_session_create_admission_v2
+    wtq_api_stream_plan_v1
+    wtq_api_session_admit_v2
+    wtq_conn_peer_admission_init_v2
+    wtq_conn_peer_admission_bytes_v2
+    wtq_conn_peer_admission_forget_v2
+    wtq_conn_stream_index_v2
+    wtq_conn_stream_retire_v2
     wtq_api_session_admission_root
     wtq_api_session_admission_detach
     wtq_api_session_set_local_flush

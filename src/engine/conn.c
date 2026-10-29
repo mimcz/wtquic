@@ -22,7 +22,7 @@
  * inline stream pool) at create; the receive path allocates nothing.
  */
 
-#define WTQ_CONN_MAX_PEER_UNI 16
+#define WTQ_CONN_LEGACY_STREAMS 16
 
 #define WTQ_CONN_SETTINGS_CAP 512
 
@@ -50,6 +50,7 @@ enum {
 };
 
 struct wtq_estream {
+    bool resident; /* budgeted owner survives detach until native retirement */
     uint64_t generation;
     bool recv_paused;
     uint8_t kind;
@@ -102,7 +103,11 @@ struct wtq_estream {
 struct wtq_conn {
     uint64_t stream_generation;
     bool admission_enabled;
-    wtq_peer_admission_t *admission_peers[15];
+    bool budgeted;
+    uint32_t stream_capacity, peer_capacity, peer_uni, local_capacity;
+    size_t allocation_size;
+    wtq_peer_admission_t **admission_peers;
+    wtq_peer_admission_t *legacy_admission_peers[15];
     wtq_alloc_t alloc;
     wtq_perspective_t persp;
     wtq_driver_t *drv;
@@ -231,8 +236,20 @@ struct wtq_conn {
     uint8_t qsid_prefix_len;
     uint64_t dgrams_dropped;
 
-    struct wtq_estream peer[WTQ_CONN_MAX_PEER_UNI];
+    struct wtq_estream peer[];
 };
+
+_Static_assert(_Alignof(struct wtq_estream) >= _Alignof(wtq_peer_admission_t *),
+               "peer-map tail must remain pointer aligned");
+
+bool wtq_conn_stream_storage_v2(uint32_t engine, uint32_t peers, size_t *bytes)
+{
+    size_t entries, map;
+    return engine <= 2049 && peers <= 1024 &&
+        wtq_capacity_mul(engine, sizeof(struct wtq_estream), &entries) &&
+        wtq_capacity_mul(peers, sizeof(wtq_peer_admission_t *), &map) &&
+        wtq_capacity_add(entries, map, bytes);
+}
 
 static const wtq_connect_opts_t CONN_STRICT_OPTS = { false, false };
 /* Server inbound-request decode for the D13/14 and D02/RFC9297 profiles:
@@ -744,7 +761,7 @@ static void session_closed(wtq_conn_t *conn, uint32_t code,
         return;
     conn->sess_state = SS_CLOSED;
 
-    for (size_t i = 0; i < WTQ_CONN_MAX_PEER_UNI; i++) {
+    for (size_t i = 0; i < conn->stream_capacity; i++) {
         struct wtq_estream *es = &conn->peer[i];
         if (es->kind != ES_WT)
             continue;
@@ -783,8 +800,9 @@ static void client_send_connect(wtq_conn_t *conn)
         return;
     }
 
-    size_t first = conn->admission_enabled ? 3u : 0u;
-    size_t end = conn->admission_enabled ? 4u : WTQ_CONN_MAX_PEER_UNI;
+    size_t first = conn->budgeted ? conn->peer_capacity + conn->local_capacity :
+        conn->admission_enabled ? 3u : 0u;
+    size_t end = conn->admission_enabled ? first + 1 : conn->stream_capacity;
     for (size_t i = first; i < end; i++)
         if (conn->peer[i].kind == ES_FREE) {
             es = &conn->peer[i];
@@ -797,6 +815,7 @@ static void client_send_connect(wtq_conn_t *conn)
     memset(es, 0, sizeof(*es));
     es->generation = ++conn->stream_generation;
     es->kind = ES_CONNECT;
+    es->resident = conn->budgeted;
     es->id = WTQ_STREAM_ID_UNKNOWN; /* explicit: 0 is a real stream id */
     wtq_h3_frame_dec_init(&es->frame_dec);
 
@@ -901,8 +920,9 @@ static void conn_fatal(wtq_conn_t *conn, uint64_t h3_err)
         conn->cb.on_conn_error(conn, h3_err, conn->cb.ctx);
 }
 
-wtq_result_t wtq_conn_create(const wtq_conn_cfg_t *cfg, wtq_driver_t *drv,
-                             const wtq_driver_ops_t *ops, wtq_conn_t **out)
+wtq_result_t wtq_conn_create_budget_v2(const wtq_conn_cfg_t *cfg,
+    wtq_driver_t *drv, const wtq_driver_ops_t *ops,
+    const wtq_stream_plan_v1_t *plan, wtq_conn_t **out)
 {
     if (cfg == NULL || cfg->alloc == NULL || drv == NULL || ops == NULL ||
         ops->open_uni == NULL || ops->open_bidi == NULL ||
@@ -946,10 +966,26 @@ wtq_result_t wtq_conn_create(const wtq_conn_cfg_t *cfg, wtq_driver_t *drv,
         return WTQ_ERR_INVALID_ARG;
     }
 
-    wtq_conn_t *conn = cfg->alloc->alloc(sizeof(*conn), cfg->alloc->ctx);
+    uint32_t capacity = plan ? plan->budget.engine_capacity : WTQ_CONN_LEGACY_STREAMS;
+    size_t tail, allocation_size;
+    uint32_t peers = plan ? plan->budget.peer_unidi_stream_count +
+        plan->budget.peer_bidi_stream_count : 0;
+    if (!wtq_conn_stream_storage_v2(capacity, peers, &tail) ||
+        !wtq_capacity_add(sizeof(wtq_conn_t), tail, &allocation_size))
+        return WTQ_ERR_INVALID_ARG;
+    wtq_conn_t *conn = cfg->alloc->alloc(allocation_size, cfg->alloc->ctx);
     if (conn == NULL)
         return WTQ_ERR_NOMEM;
-    memset(conn, 0, sizeof(*conn));
+    memset(conn, 0, allocation_size);
+    conn->allocation_size = allocation_size;
+    conn->stream_capacity = capacity;
+    conn->budgeted = plan != NULL;
+    conn->admission_enabled = plan != NULL;
+    conn->peer_capacity = plan ? peers : 15;
+    conn->peer_uni = plan ? plan->budget.peer_unidi_stream_count : 8;
+    conn->local_capacity = plan ? plan->budget.max_local_streams : 0;
+    conn->admission_peers = plan ? (wtq_peer_admission_t **)(conn->peer + capacity)
+                                : conn->legacy_admission_peers;
 
     conn->alloc = *cfg->alloc;
     conn->persp = cfg->perspective;
@@ -982,12 +1018,18 @@ wtq_result_t wtq_conn_create(const wtq_conn_cfg_t *cfg, wtq_driver_t *drv,
     return WTQ_OK;
 }
 
+wtq_result_t wtq_conn_create(const wtq_conn_cfg_t *cfg, wtq_driver_t *drv,
+    const wtq_driver_ops_t *ops, wtq_conn_t **out)
+{
+    return wtq_conn_create_budget_v2(cfg, drv, ops, NULL, out);
+}
+
 void wtq_conn_destroy(wtq_conn_t *conn)
 {
     if (conn == NULL)
         return;
     wtq_alloc_t alloc = conn->alloc;
-    alloc.free(conn, sizeof(*conn), alloc.ctx);
+    alloc.free(conn, conn->allocation_size, alloc.ctx);
 }
 
 /*
@@ -1102,7 +1144,7 @@ wtq_result_t wtq_conn_on_peer_uni_opened(wtq_conn_t *conn,
     if (lrc != WTQ_OK)
         return lrc;
 
-    for (size_t i = 0; i < WTQ_CONN_MAX_PEER_UNI; i++) {
+    for (size_t i = 0; i < conn->stream_capacity; i++) {
         struct wtq_estream *es = &conn->peer[i];
         if (es->kind == ES_FREE) {
             memset(es, 0, sizeof(*es));
@@ -1305,7 +1347,7 @@ static void control_bytes(wtq_conn_t *conn, struct wtq_estream *es,
                     conn->goaway_id = v;
                     if (conn->persp == WTQ_PERSPECTIVE_CLIENT &&
                         conn->sess_state == SS_SENT) {
-                        for (size_t i = 0; i < WTQ_CONN_MAX_PEER_UNI; i++) {
+                        for (size_t i = 0; i < conn->stream_capacity; i++) {
                             struct wtq_estream *req = &conn->peer[i];
                             if (req->kind == ES_CONNECT &&
                                 !req->native_id_pending && req->id >= v) {
@@ -1484,7 +1526,7 @@ static void estream_release(wtq_conn_t *conn, struct wtq_estream *es)
     if (es->ds != NULL)
         conn->ops.detach(conn->drv, es->ds, es);
     if (conn->admission_enabled) {
-        for (size_t i = 0; i < 15; ++i) {
+        for (size_t i = 0; i < conn->peer_capacity; ++i) {
             wtq_peer_admission_t *p = conn->admission_peers[i];
             if (p != NULL && p->es == es) {
                 p->es = NULL;
@@ -2966,7 +3008,7 @@ wtq_result_t wtq_conn_on_peer_bidi_opened(wtq_conn_t *conn,
     /* Classification is deferred to the first bytes: a 0x41 WT
      * preamble joins the session on either perspective; anything else
      * is a request stream (server) or a protocol error (client). */
-    for (size_t i = 0; i < WTQ_CONN_MAX_PEER_UNI; i++) {
+    for (size_t i = 0; i < conn->stream_capacity; i++) {
         struct wtq_estream *es = &conn->peer[i];
         if (es->kind == ES_FREE) {
             memset(es, 0, sizeof(*es));
@@ -3072,16 +3114,17 @@ static wtq_result_t wt_open(wtq_conn_t *conn, bool bidi,
         return WTQ_ERR_STATE;
 
     struct wtq_estream *es = NULL;
-    size_t first = conn->admission_enabled
+    size_t first = conn->budgeted ? conn->peer_capacity : conn->admission_enabled
         ? (conn->persp == WTQ_PERSPECTIVE_CLIENT ? 4u : 10u) : 0u;
-    if (conn->admission_enabled) {
+    if (conn->admission_enabled && !conn->budgeted) {
         for (size_t i = 0; i < 15; ++i)
             if (conn->admission_peers[i] != NULL &&
                 conn->admission_peers[i]->state == 1)
                 return WTQ_ERR_WOULD_BLOCK;
     }
-    for (size_t i = first; i < WTQ_CONN_MAX_PEER_UNI; i++)
-        if (conn->peer[i].kind == ES_FREE) {
+    size_t end = conn->budgeted ? first + conn->local_capacity : conn->stream_capacity;
+    for (size_t i = first; i < end; i++)
+        if (conn->peer[i].kind == ES_FREE && !conn->peer[i].resident) {
             es = &conn->peer[i];
             break;
         }
@@ -3092,12 +3135,14 @@ static wtq_result_t wt_open(wtq_conn_t *conn, bool bidi,
     es->id = WTQ_STREAM_ID_UNKNOWN; /* explicit: 0 is a real stream id */
 
     uint64_t id = WTQ_STREAM_ID_UNKNOWN;
+    es->resident = conn->budgeted;
     if (conn->admission_enabled) es->kind = ES_RESERVED;
     wtq_result_t rc =
         bidi ? conn->ops.open_bidi(conn->drv, es, &es->ds, &id)
              : conn->ops.open_uni(conn->drv, es, &es->ds, &id);
     if (rc != WTQ_OK) {
         if (conn->admission_enabled) es->kind = ES_FREE;
+        es->resident = false;
         return rc;
     }
     if (conn->admission_enabled && (conn->closed || !session_active(conn))) {
@@ -3467,7 +3512,7 @@ void wtq_conn_on_stream_native_id(wtq_conn_t *conn, wtq_estream_t *es,
         native_id_report_invalid(conn);
         return;
     }
-    for (size_t i = 0; i < WTQ_CONN_MAX_PEER_UNI; i++) {
+    for (size_t i = 0; i < conn->stream_capacity; i++) {
         const struct wtq_estream *o = &conn->peer[i];
         if (o != es && o->kind != ES_FREE &&
             o->id != WTQ_STREAM_ID_UNKNOWN && o->id == native_id) {
@@ -3502,7 +3547,7 @@ void wtq_conn_on_stream_send_shutdown_v1(wtq_conn_t *conn,
         es == NULL || ds == NULL || generation == 0)
         return;
     bool owned = false;
-    for (size_t i = 0; i < WTQ_CONN_MAX_PEER_UNI; ++i)
+    for (size_t i = 0; i < conn->stream_capacity; ++i)
         if (es == &conn->peer[i]) owned = true;
     if (!owned || es->kind != ES_WT || es->ds != ds ||
         es->generation != generation || !es->wt_send_commit ||
@@ -3733,7 +3778,7 @@ wtq_result_t wtq_conn_peer_admission_init(wtq_conn_t *conn,
     wtq_peer_admission_t *p, wtq_dstream_t *ds, uint64_t id,
     bool bidi, unsigned reservation)
 {
-    if (!conn || !p || !ds || !conn->admission_enabled ||
+    if (!conn || !p || !ds || !conn->admission_enabled || conn->budgeted ||
         reservation >= 15 || (bidi ? reservation < 8 : reservation >= 8) ||
         conn->admission_peers[reservation] != NULL)
         return WTQ_ERR_INVALID_ARG;
@@ -3764,6 +3809,7 @@ static wtq_estream_t *admission_entry(wtq_conn_t *conn,
     memset(es, 0, sizeof(*es));
     es->generation = ++conn->stream_generation;
     es->kind = kind;
+    es->resident = conn->budgeted;
     es->ds = p->ds;
     es->id = p->id;
     p->es = es;
@@ -3776,7 +3822,14 @@ wtq_result_t wtq_conn_peer_admit(wtq_conn_t *conn, wtq_peer_admission_t *p)
     if (!conn || !p || p->state != 1) return WTQ_ERR_INVALID_ARG;
     if (conn->closed) return WTQ_ERR_CLOSED;
     size_t first = conn->persp == WTQ_PERSPECTIVE_CLIENT ? 4u : 10u;
-    for (size_t i = first; i < WTQ_CONN_MAX_PEER_UNI; ++i) {
+    size_t end = conn->stream_capacity;
+    if (conn->budgeted) {
+        for (first = 0; first < conn->peer_capacity; ++first)
+            if (conn->admission_peers[first] == p) break;
+        if (first == conn->peer_capacity) return WTQ_ERR_INVALID_ARG;
+        end = first + 1;
+    }
+    for (size_t i = first; i < end; ++i) {
         wtq_estream_t *es = admission_entry(conn, p, i, ES_WT);
         if (!es) continue;
         (void)wt_associate(conn, es, p->session_id, p->bidi);
@@ -3785,8 +3838,8 @@ wtq_result_t wtq_conn_peer_admit(wtq_conn_t *conn, wtq_peer_admission_t *p)
     return WTQ_ERR_WOULD_BLOCK;
 }
 
-wtq_result_t wtq_conn_peer_admission_bytes(wtq_conn_t *conn,
-    wtq_peer_admission_t *p, const uint8_t *data, size_t len,
+static wtq_result_t peer_admission_bytes(wtq_conn_t *conn,
+    wtq_peer_admission_t *p, uint32_t reservation, const uint8_t *data, size_t len,
     bool fin, uint64_t now_us, size_t *consumed)
 {
     if (consumed) *consumed = 0;
@@ -3840,7 +3893,8 @@ wtq_result_t wtq_conn_peer_admission_bytes(wtq_conn_t *conn,
             conn_fatal(conn, WTQ_H3_STREAM_CREATION_ERROR);
             return WTQ_ERR_PROTO;
         }
-        es = admission_entry(conn, p, 3u + p->reservation - 8u, ES_REQUEST);
+        es = admission_entry(conn, p, conn->budgeted ? reservation :
+            3u + reservation - 8u, ES_REQUEST);
         if (!es) return WTQ_ERR_STATE; /* resident record owns this reservation */
         wtq_h3_frame_dec_init(&es->frame_dec);
         request_stream_bytes(conn, es, p->prefix, p->fill);
@@ -3862,7 +3916,8 @@ wtq_result_t wtq_conn_peer_admission_bytes(wtq_conn_t *conn,
             conn_fatal(conn, WTQ_H3_STREAM_CREATION_ERROR);
             return WTQ_ERR_PROTO;
         }
-        es = admission_entry(conn, p, type == 0 ? 0u : (size_t)type - 1u, ES_TYPE);
+        es = admission_entry(conn, p, conn->budgeted ? reservation :
+            type == 0 ? 0u : (size_t)type - 1u, ES_TYPE);
         if (!es) return WTQ_ERR_STATE;
         if (!classify_uni(conn, es, type)) return WTQ_ERR_PROTO;
     }
@@ -3873,4 +3928,101 @@ wtq_result_t wtq_conn_peer_admission_bytes(wtq_conn_t *conn,
         len - used, fin, now_us, &tail);
     *consumed += tail;
     return rc;
+}
+
+wtq_result_t wtq_conn_peer_admission_bytes(wtq_conn_t *conn,
+    wtq_peer_admission_t *p, const uint8_t *data, size_t len,
+    bool fin, uint64_t now_us, size_t *consumed)
+{
+    if (conn && conn->budgeted) return WTQ_ERR_INVALID_ARG;
+    return peer_admission_bytes(conn, p, p ? p->reservation : 0,
+        data, len, fin, now_us, consumed);
+}
+
+wtq_result_t wtq_conn_peer_admission_init_v2(wtq_conn_t *conn,
+    wtq_peer_admission_v2_t *p, wtq_dstream_t *ds, uint64_t id,
+    bool bidi, uint32_t reservation)
+{
+    if (!conn || !conn->budgeted || !p || p->struct_size < sizeof(*p) || !ds ||
+        reservation >= conn->peer_capacity ||
+        (bidi ? reservation < conn->peer_uni : reservation >= conn->peer_uni) ||
+        conn->admission_peers[reservation] || conn->peer[reservation].resident)
+        return WTQ_ERR_INVALID_ARG;
+    if (conn->closed) return WTQ_ERR_CLOSED;
+    wtq_result_t rc = conn_open_locals_if_deferred(conn);
+    if (rc != WTQ_OK) return rc;
+    memset(&p->prefix, 0, sizeof(p->prefix));
+    p->reservation = reservation;
+    p->prefix.ds = ds;
+    p->prefix.id = id;
+    p->prefix.bidi = bidi;
+    conn->admission_peers[reservation] = &p->prefix;
+    conn->peer[reservation].resident = true;
+    conn->peer[reservation].ds = ds;
+    return WTQ_OK;
+}
+
+wtq_result_t wtq_conn_peer_admission_bytes_v2(wtq_conn_t *conn,
+    wtq_peer_admission_v2_t *p, const uint8_t *data, size_t len,
+    bool fin, uint64_t now_us, size_t *consumed)
+{
+    if (consumed) *consumed = 0;
+    if (!conn || !conn->budgeted || !p || p->struct_size < sizeof(*p) ||
+        p->reservation >= conn->peer_capacity ||
+        conn->admission_peers[p->reservation] != &p->prefix)
+        return WTQ_ERR_INVALID_ARG;
+    return peer_admission_bytes(conn, &p->prefix, p->reservation,
+        data, len, fin, now_us, consumed);
+}
+
+void wtq_conn_peer_admission_forget_v2(wtq_conn_t *conn,
+    wtq_peer_admission_v2_t *p)
+{
+    if (conn && conn->budgeted && p && p->struct_size >= sizeof(*p) &&
+        p->reservation < conn->peer_capacity &&
+        conn->admission_peers[p->reservation] == &p->prefix)
+        conn->admission_peers[p->reservation] = NULL;
+}
+
+uint32_t wtq_conn_stream_index_v2(const wtq_conn_t *conn, const wtq_estream_t *es)
+{
+    if (conn && conn->budgeted && es)
+        for (uint32_t i = 0; i < conn->stream_capacity; ++i)
+            if (es == &conn->peer[i]) return i;
+    return UINT32_MAX;
+}
+
+bool wtq_conn_stream_available_v2(const wtq_conn_t *conn, uint32_t index)
+{
+    return conn && conn->budgeted && index < conn->stream_capacity &&
+        !conn->peer[index].resident && conn->peer[index].kind == ES_FREE;
+}
+
+void wtq_conn_stream_retire_v2(wtq_conn_t *conn, uint32_t index,
+    const wtq_dstream_t *ds)
+{
+    if (conn && conn->budgeted && index < conn->stream_capacity &&
+        conn->peer[index].ds == ds && conn->peer[index].kind == ES_FREE) {
+        conn->peer[index].resident = false;
+        conn->peer[index].ds = NULL;
+    }
+}
+
+void wtq_conn_stream_budget_v2(const wtq_conn_t *conn, wtq_stream_budget_t *out)
+{
+    out->peer_wt_live = out->local_wt_live = out->http_critical_live = 0;
+    out->http_request_live = out->peer_wt_waiting = 0;
+    for (uint32_t i = 0; i < conn->stream_capacity; ++i) {
+        const struct wtq_estream *es = &conn->peer[i];
+        if (es->kind == ES_WT) {
+            if (es->wt_local) ++out->local_wt_live;
+            else ++out->peer_wt_live;
+        } else if (es->kind == ES_CONTROL || es->kind == ES_QPACK)
+            ++out->http_critical_live;
+        else if (es->kind == ES_CONNECT || es->kind == ES_REQUEST)
+            ++out->http_request_live;
+    }
+    for (uint32_t i = 0; i < conn->peer_capacity; ++i)
+        if (conn->admission_peers[i] && conn->admission_peers[i]->state == 1)
+            ++out->peer_wt_waiting;
 }

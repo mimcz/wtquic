@@ -286,6 +286,7 @@ static QUIC_STATUS QUIC_API listener_callback(HQUIC listener, void *ctx,
     drv->guard = child_guard;
     drv->on_transport_quiesced = l->on_transport_quiesced;
     drv->quiesced_user = child_user;
+    drv->max_local_streams = l->stream_plan.budget.max_local_streams;
 
     /* Session construction runs UNTRACKED: MsQuic owns the unaccepted
      * connection, no handler is set, so no event can reach this state
@@ -303,13 +304,15 @@ static QUIC_STATUS QUIC_API listener_callback(HQUIC listener, void *ctx,
         .webtransport_profiles = l->webtransport_profiles,
     };
     wtq_session_t *session = NULL;
-    if (wtq_msq_session_create_bounded(drv, &scfg, &l->env->tuning, &session) != WTQ_OK || fail_stage == 2) {
+    wtq_result_t create_rc = wtq_msq_session_create_bounded(drv, &scfg, &l->env->tuning, &session);
+    if (create_rc != WTQ_OK || fail_stage == 2) {
         if (session != NULL)
             wtq_session_release(session); /* simulated stage-2 failure */
         wtq_msq_conn_free(drv); /* drv->conn unset: no ConnectionClose */
         if (admitted)
             listener_abandon(l, &child_guard, child_user);
-        return QUIC_STATUS_OUT_OF_MEMORY;
+        return create_rc == WTQ_ERR_NOMEM || fail_stage == 2
+            ? QUIC_STATUS_OUT_OF_MEMORY : QUIC_STATUS_INTERNAL_ERROR;
     }
 
     wtq_serve_config_t serve[WTQ_MSQ_MAX_PATHS];
@@ -436,6 +439,10 @@ wtq_result_t wtq_msquic_listener_start(wtq_msquic_env_t *env,
         cfg.path_stride = sizeof(wtq_serve_config_v1_t);
     else if (cfg.path_stride == 0)
         cfg.path_stride = sizeof(wtq_serve_config_t);
+    if (!wtq_cfg_has(cfg_in->struct_size,
+                     offsetof(wtq_msquic_listener_cfg_t, max_local_streams),
+                     sizeof(cfg.max_local_streams)))
+        cfg.max_local_streams = 0;
 
     if (cfg.cert_file == NULL || cfg.key_file == NULL ||
         cfg.events == NULL || cfg.events->struct_size == 0)
@@ -475,6 +482,10 @@ wtq_result_t wtq_msquic_listener_start(wtq_msquic_env_t *env,
     if ((cfg.accept_prepare != NULL) != (cfg.accept_abandon != NULL))
         return WTQ_ERR_INVALID_ARG;
 
+    wtq_stream_plan_v1_t plan = { .struct_size = sizeof(plan) };
+    wtq_result_t plan_rc = wtq_msq_stream_plan(&env->tuning, cfg.max_local_streams, false, &plan);
+    if (plan_rc != WTQ_OK) return plan_rc;
+
     struct wtq_msquic_listener *l =
         env->alloc.alloc(sizeof(*l), env->alloc.ctx);
     if (l == NULL)
@@ -482,6 +493,7 @@ wtq_result_t wtq_msquic_listener_start(wtq_msquic_env_t *env,
     memset(l, 0, sizeof(*l));
     l->alloc = env->alloc;
     l->env = env;
+    l->stream_plan = plan;
     /* size-checked copy of the app's event table — the SAME normaliser the
      * core uses at session create, so a partial callback pointer is zeroed
      * here too and the retained table can never dispatch through a truncated

@@ -497,9 +497,11 @@ static int test_listener_cfg_init_v1_abi(void)
  *     optional tail was honoured (or ignored) exactly as struct_size dictates.
  */
 static struct wtq_driver *g_abi_drv;
+static unsigned g_abi_config_calls;
 static QUIC_STATUS QUIC_API abi_config_open(HQUIC r, const QUIC_BUFFER *a,
     uint32_t n, const QUIC_SETTINGS *s, uint32_t sz, void *c, HQUIC *out)
 { (void)r;(void)a;(void)n;(void)s;(void)sz;(void)c; *out = (HQUIC)0x11;
+  ++g_abi_config_calls;
   return QUIC_STATUS_SUCCESS; }
 static QUIC_STATUS QUIC_API abi_config_cred(HQUIC c,
     const QUIC_CREDENTIAL_CONFIG *cr)
@@ -1167,6 +1169,7 @@ static int test_abi_listener_profile_set(void)
     const size_t v1 = sizeof(wtq_msquic_listener_cfg_v1_t);
     const size_t v3 = sizeof(wtq_msquic_listener_cfg_v3_t);
     const size_t v4 = sizeof(wtq_msquic_listener_cfg_v4_t);
+    const size_t v5 = sizeof(wtq_msquic_listener_cfg_v5_t);
     const size_t full = sizeof(wtq_msquic_listener_cfg_t);
     const size_t soff =
         offsetof(wtq_msquic_listener_cfg_t, webtransport_profiles);
@@ -1206,11 +1209,21 @@ static int test_abi_listener_profile_set(void)
     const size_t stride_off =
         offsetof(wtq_msquic_listener_cfg_t, path_stride);
 
-    /* The set begins after v3; the stride begins after frozen v4. */
+    const size_t local_off =
+        offsetof(wtq_msquic_listener_cfg_t, max_local_streams);
+
+    /* The set begins after v3; the stride begins after frozen v4 and
+     * completes frozen v5 at its old offset; max_local_streams follows the
+     * complete v5 and the current struct covers it. */
     WTQ_TEST_CHECK(soff >= v3);
     WTQ_TEST_CHECK_EQ_SIZE(v4, soff + slen);
     WTQ_TEST_CHECK(stride_off >= v4);
-    WTQ_TEST_CHECK_EQ_SIZE(full, stride_off + sizeof(size_t));
+    WTQ_TEST_CHECK_EQ_SIZE(stride_off,
+        offsetof(wtq_msquic_listener_cfg_v5_t, path_stride));
+    WTQ_TEST_CHECK_EQ_SIZE(v5, stride_off + sizeof(size_t));
+    WTQ_TEST_CHECK(local_off >= v5);
+    WTQ_TEST_CHECK(full >= local_off +
+        sizeof(((wtq_msquic_listener_cfg_t *)0)->max_local_streams));
 
     /* (1) exact frozen v1: accepted, defaults CURRENT */
     WTQ_TEST_CHECK_EQ_U64(
@@ -1848,9 +1861,95 @@ static int test_client_unwind_cross_thread(void)
     return failures;
 }
 
+static int test_stream_budget_config_tail(void)
+{
+    int failures = 0;
+    wtq_connect_config_t connect;
+    wtq_session_events_t events;
+    abi_connect_inputs(&connect, &events);
+    wtq_serve_config_t serve;
+    abi_serve(&serve);
+    for (unsigned client = 0; client < 2; ++client) {
+        for (unsigned row = 0; row < 10; ++row) {
+            const size_t current = client ? sizeof(wtq_msquic_client_cfg_t) :
+                sizeof(wtq_msquic_listener_cfg_t);
+            const size_t old = client ? sizeof(wtq_msquic_client_cfg_v2_t) :
+                sizeof(wtq_msquic_listener_cfg_v5_t);
+            const size_t offset = client ? offsetof(wtq_msquic_client_cfg_t, max_local_streams) :
+                offsetof(wtq_msquic_listener_cfg_t, max_local_streams);
+            size_t size = row == 0 ? old : row <= 3 ? offset + row :
+                row == 9 ? current + 16 : current;
+            uint32_t local = row == 5 ? 1 : row == 6 ? 1024 : row == 7 ? 1025 :
+                row == 8 ? UINT32_MAX : row == 9 ? 4 : 0;
+            bool valid = row != 7 && row != 8;
+            uint8_t *buf = malloc(size + 8);
+            WTQ_TEST_CHECK(buf != NULL);
+            if (!buf) continue;
+            memset(buf, 0xa5, size + 8);
+            if (client) {
+                wtq_msquic_client_cfg_init_ex((void *)buf, size);
+                abi_set_v1(buf, (uint32_t)size, &connect, &events, NULL);
+            } else {
+                wtq_msquic_listener_cfg_init_ex((void *)buf, size);
+                abi_set_listener_v1(buf, (uint32_t)size, &serve, &events, NULL);
+            }
+            if (row >= 1 && row <= 3) memset(buf + offset, 0xee, row);
+            if (row >= 4) memcpy(buf + offset, &local, sizeof(local));
+            uint8_t *before = malloc(size + 8);
+            WTQ_TEST_CHECK(before != NULL);
+            if (!before) { free(buf); continue; }
+            memcpy(before, buf, size + 8);
+            for (size_t i = size; i < size + 8; ++i) WTQ_TEST_CHECK_EQ_INT(buf[i], 0xa5);
+            if (row == 9)
+                for (size_t i = current; i < size; ++i) WTQ_TEST_CHECK_EQ_INT(buf[i], 0xa5);
+            struct wtq_msquic_env env;
+            QUIC_API_TABLE api;
+            abi_env_init(&env, &api);
+            g_abi_drv = NULL;
+            g_abi_config_calls = 0;
+            uint32_t effective = local ? local : 16;
+            if (client) {
+                wtq_session_t *session = NULL;
+                WTQ_TEST_CHECK_EQ_INT(wtq_msquic_client_connect(&env, (void *)buf, &session),
+                    valid ? WTQ_OK : WTQ_ERR_INVALID_ARG);
+                WTQ_TEST_CHECK((session != NULL) == valid);
+                if (session) {
+                    wtq_stream_budget_t budget = WTQ_STREAM_BUDGET_INIT;
+                    WTQ_TEST_CHECK_EQ_INT(wtq_session_stream_budget(session, &budget), WTQ_OK);
+                    WTQ_TEST_CHECK_EQ_INT(budget.max_local_streams, effective);
+                    WTQ_TEST_CHECK_EQ_INT(budget.api_capacity, 15 + effective);
+                    WTQ_TEST_CHECK_EQ_INT(budget.engine_capacity, 16 + effective);
+                    WTQ_TEST_CHECK_EQ_INT(budget.native_capacity, 19 + effective);
+                    feed_conn(g_abi_drv, QUIC_CONNECTION_EVENT_SHUTDOWN_COMPLETE);
+                    wtq_session_release(session);
+                }
+            } else {
+                wtq_msquic_listener_t *listener = NULL;
+                WTQ_TEST_CHECK_EQ_INT(wtq_msquic_listener_start(&env, (void *)buf, &listener),
+                    valid ? WTQ_OK : WTQ_ERR_INVALID_ARG);
+                WTQ_TEST_CHECK((listener != NULL) == valid);
+                if (listener) {
+                    WTQ_TEST_CHECK_EQ_INT(listener->stream_plan.budget.max_local_streams, effective);
+                    WTQ_TEST_CHECK_EQ_INT(listener->stream_plan.budget.api_capacity, 15 + effective);
+                    WTQ_TEST_CHECK_EQ_INT(listener->stream_plan.budget.engine_capacity, 15 + effective);
+                    WTQ_TEST_CHECK_EQ_INT(listener->stream_plan.budget.native_capacity, 18 + effective);
+                    wtq_msquic_listener_stop(listener);
+                }
+            }
+            WTQ_TEST_CHECK_EQ_INT(g_abi_config_calls, valid ? 1 : 0);
+            WTQ_TEST_CHECK(memcmp(buf, before, size + 8) == 0);
+            abi_env_destroy(&env);
+            free(before);
+            free(buf);
+        }
+    }
+    return failures;
+}
+
 int main(void)
 {
     int failures = 0;
+    failures += test_stream_budget_config_tail();
     failures += test_guard_brackets_callbacks();
     failures += test_leave_after_driver_free();
     failures += test_guarded_out_of_callback_op();

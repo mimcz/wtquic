@@ -83,6 +83,10 @@ wtq_result_t wtq_msquic_client_connect(wtq_msquic_env_t *env,
                      offsetof(wtq_msquic_client_cfg_t, on_transport_quiesced),
                      sizeof(cfg.on_transport_quiesced)))
         cfg.on_transport_quiesced = NULL;
+    if (!wtq_cfg_has(cfg_in->struct_size,
+                     offsetof(wtq_msquic_client_cfg_t, max_local_streams),
+                     sizeof(cfg.max_local_streams)))
+        cfg.max_local_streams = 0;
 
     if (cfg.server_name == NULL || cfg.port == 0 || cfg.connect == NULL ||
         cfg.events == NULL || cfg.events->struct_size == 0)
@@ -91,10 +95,15 @@ wtq_result_t wtq_msquic_client_connect(wtq_msquic_env_t *env,
     if ((cfg.guard.enter != NULL) != (cfg.guard.leave != NULL))
         return WTQ_ERR_INVALID_ARG;
 
+    wtq_stream_plan_v1_t plan = { .struct_size = sizeof(plan) };
+    wtq_result_t rc = wtq_msq_stream_plan(&env->tuning, cfg.max_local_streams, true, &plan);
+    if (rc != WTQ_OK) return rc;
+
     struct wtq_driver *drv =
         wtq_msq_conn_new(&env->alloc, env->api, true);
     if (drv == NULL)
         return WTQ_ERR_NOMEM;
+    drv->max_local_streams = plan.budget.max_local_streams;
 
     /* Managed-domain wiring, installed BEFORE ConnectionOpen so the guard
      * is in place before any event can fire: a caller holding guard.ctx
@@ -147,7 +156,7 @@ wtq_result_t wtq_msquic_client_connect(wtq_msquic_env_t *env,
         .ops = wtq_msq_driver_ops(),
     };
     wtq_session_t *session = NULL;
-    wtq_result_t rc = wtq_msq_session_create_bounded(drv, &scfg, &env->tuning, &session);
+    rc = wtq_msq_session_create_bounded(drv, &scfg, &env->tuning, &session);
     if (rc == WTQ_OK)
         rc = wtq_api_session_connect(session, cfg.connect);
     if (rc != WTQ_OK) {

@@ -23,8 +23,20 @@
  * released or re-used its slot by then.
  */
 
-#define WTQ_API_MAX_STREAMS 16
+#define WTQ_API_LEGACY_STREAMS 16
 #define WTQ_API_MAX_PATHS 4
+
+_Static_assert(offsetof(wtq_stream_budget_t, capacity_bytes) == 32,
+               "stream budget v1 capacity offset");
+_Static_assert(offsetof(wtq_stream_budget_t, peer_uni_resident) == 40,
+               "stream budget v1 gauges offset");
+_Static_assert(offsetof(wtq_stream_budget_t, local_open_blocked) == 88,
+               "stream budget v1 counters offset");
+_Static_assert(offsetof(wtq_stream_budget_t, admission_resume_failures) +
+               sizeof(uint64_t) == WTQ_STREAM_BUDGET_V1_SIZE,
+               "stream budget v1 floor");
+_Static_assert(sizeof(wtq_stream_budget_t) == WTQ_STREAM_BUDGET_V1_SIZE,
+               "stream budget v1 layout");
 
 struct wtq_stream {
     uint32_t refs;      /* total slot occupancy; 0 = slot free. Sum of
@@ -50,6 +62,12 @@ struct wtq_stream {
 
 struct wtq_session {
     uint32_t refs;
+    uint32_t stream_capacity;
+    size_t allocation_size;
+    bool budgeted;
+    bool budget_frozen;
+    wtq_stream_budget_t budget;
+    const wtq_stream_budget_t *native_budget;
     wtq_alloc_t alloc;
     wtq_conn_t *conn;
     wtq_perspective_t perspective;
@@ -85,8 +103,33 @@ struct wtq_session {
     bool profile_available;
     wtq_webtransport_profile_t profile;
 
-    struct wtq_stream streams[WTQ_API_MAX_STREAMS];
+    struct wtq_stream streams[];
 };
+
+static void stream_budget_snapshot(const wtq_session_t *s, wtq_stream_budget_t *out)
+{
+    *out = s->budget;
+    if (s->budget_frozen) return;
+    if (s->native_budget) {
+        *out = *s->native_budget;
+        out->local_open_blocked = s->budget.local_open_blocked;
+    }
+    wtq_conn_stream_budget_v2(s->conn, out);
+    out->api_retained_terminal = 0;
+    for (uint32_t i = 0; i < s->stream_capacity; ++i)
+        if (s->streams[i].refs && !s->streams[i].alive)
+            ++out->api_retained_terminal;
+}
+
+static void stream_budget_freeze(wtq_session_t *s)
+{
+    if (!s->budgeted || s->budget_frozen) return;
+    wtq_stream_budget_t snapshot;
+    stream_budget_snapshot(s, &snapshot);
+    s->budget = snapshot;
+    s->budget_frozen = true;
+    s->native_budget = NULL;
+}
 
 /* --- config helpers ------------------------------------------------------ */
 
@@ -314,7 +357,7 @@ static void session_destroy(wtq_session_t *s)
 
     if (s->conn != NULL)
         wtq_conn_destroy(s->conn);
-    alloc.free(s, sizeof(*s), alloc.ctx);
+    alloc.free(s, s->allocation_size, alloc.ctx);
 }
 
 static void session_enter(wtq_session_t *s)
@@ -354,9 +397,17 @@ static struct wtq_stream *stream_acquire(wtq_session_t *s,
                                          wtq_estream_t *es, bool bidi,
                                          bool local, uint64_t id)
 {
-    for (size_t i = 0; i < WTQ_API_MAX_STREAMS; i++) {
+    uint32_t first = 0, end = s->stream_capacity;
+    if (s->budgeted) {
+        first = local ? s->budget.peer_unidi_stream_count +
+            s->budget.peer_bidi_stream_count : wtq_conn_stream_index_v2(s->conn, es);
+        if (first >= end) return NULL;
+        if (!local) end = first + 1;
+    }
+    for (uint32_t i = first; i < end; i++) {
         struct wtq_stream *st = &s->streams[i];
-        if (st->refs == 0) {
+        if (st->refs == 0 && (!s->budgeted || !local || es ||
+            wtq_conn_stream_available_v2(s->conn, i))) {
             memset(st, 0, sizeof(*st));
             st->refs = 1; /* the library's ref */
             st->alive = true;
@@ -453,7 +504,7 @@ static void stream_maybe_terminal(wtq_session_t *s, struct wtq_stream *st)
  * reset/stopped the wire side). */
 static void streams_teardown(wtq_session_t *s)
 {
-    for (size_t i = 0; i < WTQ_API_MAX_STREAMS; i++) {
+    for (size_t i = 0; i < s->stream_capacity; i++) {
         struct wtq_stream *st = &s->streams[i];
         if (st->refs > 0 && st->alive) {
             st->send_open = false;
@@ -529,6 +580,7 @@ static void adapt_rejected(wtq_conn_t *conn, uint16_t status, void *ctx)
 
     session_enter(s);
     if (!s->terminal_fired) {
+        stream_budget_freeze(s);
         s->terminal_fired = true;
         s->failed = true;
         wtq_conn_seal_transport_error(conn);
@@ -545,6 +597,7 @@ static void adapt_failed(wtq_conn_t *conn, wtq_session_fail_reason_t why,
 
     session_enter(s);
     if (!s->terminal_fired) {
+        stream_budget_freeze(s);
         s->terminal_fired = true;
         s->failed = true;
         wtq_conn_seal_transport_error(conn);
@@ -589,6 +642,7 @@ static void adapt_session_closed(wtq_conn_t *conn, uint32_t code,
 
     session_enter(s);
     if (!s->terminal_fired) {
+        stream_budget_freeze(s);
         s->terminal_fired = true;
         wtq_conn_seal_transport_error(conn);
         streams_teardown(s);
@@ -618,6 +672,7 @@ static void adapt_conn_error(wtq_conn_t *conn, uint64_t h3_err, void *ctx)
      * is normally already set by the time we get here. This covers a
      * driver that reports a connection error without one. */
     if (!s->terminal_fired) {
+        stream_budget_freeze(s);
         s->terminal_fired = true;
         s->failed = true;
         wtq_conn_seal_transport_error(conn);
@@ -819,8 +874,8 @@ static void adapt_datagram(wtq_conn_t *conn, const uint8_t *data,
 
 /* --- constructor seam ----------------------------------------------------- */
 
-wtq_result_t wtq_api_session_create(const wtq_api_session_cfg_t *cfg,
-                                    wtq_session_t **out)
+static wtq_result_t session_create(const wtq_api_session_cfg_t *cfg,
+    const wtq_stream_plan_v1_t *plan, wtq_session_t **out)
 {
     if (out == NULL)
         return WTQ_ERR_INVALID_ARG;
@@ -831,12 +886,20 @@ wtq_result_t wtq_api_session_create(const wtq_api_session_cfg_t *cfg,
         cfg->ops == NULL)
         return WTQ_ERR_INVALID_ARG;
 
-    wtq_session_t *s =
-        cfg->alloc->alloc(sizeof(wtq_session_t), cfg->alloc->ctx);
+    uint32_t capacity = plan ? plan->budget.api_capacity : WTQ_API_LEGACY_STREAMS;
+    size_t tail, allocation_size;
+    if (!wtq_capacity_mul(capacity, sizeof(struct wtq_stream), &tail) ||
+        !wtq_capacity_add(sizeof(wtq_session_t), tail, &allocation_size))
+        return WTQ_ERR_INVALID_ARG;
+    wtq_session_t *s = cfg->alloc->alloc(allocation_size, cfg->alloc->ctx);
     if (s == NULL)
         return WTQ_ERR_NOMEM;
-    memset(s, 0, sizeof(*s));
+    memset(s, 0, allocation_size);
     s->refs = 1;
+    s->stream_capacity = capacity;
+    s->allocation_size = allocation_size;
+    s->budgeted = plan != NULL;
+    if (plan) s->budget = plan->budget;
     s->alloc = *cfg->alloc;
     s->perspective = cfg->perspective;
     s->send_commit_mode = (cfg->ops->caps & WTQ_DCAP_SEND_COMMIT_ACK_FIN)
@@ -867,12 +930,88 @@ wtq_result_t wtq_api_session_create(const wtq_api_session_cfg_t *cfg,
                        .on_wt_stream_send_committed = adapt_send_committed,
                        .ctx = s },
     };
-    wtq_result_t rc = wtq_conn_create(&ccfg, cfg->drv, cfg->ops, &s->conn);
+    wtq_result_t rc = wtq_conn_create_budget_v2(&ccfg, cfg->drv, cfg->ops, plan, &s->conn);
     if (rc != WTQ_OK) {
-        s->alloc.free(s, sizeof(*s), s->alloc.ctx);
+        s->alloc.free(s, allocation_size, s->alloc.ctx);
         return rc;
     }
     *out = s;
+    return WTQ_OK;
+}
+
+wtq_result_t wtq_api_session_create(const wtq_api_session_cfg_t *cfg,
+    wtq_session_t **out)
+{
+    return session_create(cfg, NULL, out);
+}
+
+wtq_result_t wtq_api_stream_plan_v1(uint32_t uni, uint32_t bidi,
+    uint32_t local, bool client, size_t native_record_size,
+    size_t scratch_record_size, wtq_stream_plan_v1_t *out)
+{
+    if (!out || out->struct_size < sizeof(*out) || !native_record_size ||
+        !scratch_record_size) return WTQ_ERR_INVALID_ARG;
+    if (!local) local = 16;
+    if (!wtq_stream_counts_valid(uni, bidi, local)) return WTQ_ERR_INVALID_ARG;
+    wtq_stream_plan_v1_t p = { .struct_size = sizeof(p), .client = client,
+        .budget = WTQ_STREAM_BUDGET_INIT };
+    p.budget.peer_unidi_stream_count = uni;
+    p.budget.peer_bidi_stream_count = bidi;
+    p.budget.max_local_streams = local;
+    p.budget.api_capacity = uni + bidi + local;
+    p.budget.engine_capacity = p.budget.api_capacity + (client ? 1u : 0u);
+    p.budget.native_capacity = p.budget.engine_capacity + 3;
+    size_t total = 0;
+    if (!wtq_conn_stream_storage_v2(p.budget.engine_capacity, uni + bidi, &p.engine_bytes) ||
+        !wtq_capacity_mul(p.budget.api_capacity, sizeof(struct wtq_stream), &p.api_bytes) ||
+        !wtq_capacity_mul(p.budget.native_capacity, native_record_size, &p.native_bytes) ||
+        !wtq_capacity_mul(uni + bidi, scratch_record_size, &p.scratch_bytes) ||
+        !wtq_capacity_add(total, p.engine_bytes, &total) ||
+        !wtq_capacity_add(total, p.api_bytes, &total) ||
+        !wtq_capacity_add(total, p.native_bytes, &total) ||
+        !wtq_capacity_add(total, p.scratch_bytes, &total)) return WTQ_ERR_INVALID_ARG;
+    p.budget.capacity_bytes = total;
+    *out = p;
+    return WTQ_OK;
+}
+
+wtq_result_t wtq_api_session_create_admission_v2(const wtq_api_session_cfg_t *cfg,
+    const wtq_api_admission_v2_t *ops, wtq_session_t **out)
+{
+    if (out) *out = NULL;
+    if (!cfg || !out || !ops || ops->struct_size < sizeof(*ops) ||
+        !ops->plan || ops->plan->struct_size < sizeof(*ops->plan) ||
+        !ops->native_budget) return WTQ_ERR_INVALID_ARG;
+    const wtq_stream_plan_v1_t *p = ops->plan;
+    const wtq_stream_budget_t *b = &p->budget;
+    uint32_t peers = b->peer_unidi_stream_count + b->peer_bidi_stream_count;
+    size_t engine_bytes, api_bytes, total = 0;
+    if (!wtq_stream_counts_valid(b->peer_unidi_stream_count, b->peer_bidi_stream_count,
+            b->max_local_streams) ||
+        p->client != (uint32_t)(cfg->perspective == WTQ_PERSPECTIVE_CLIENT) ||
+        b->api_capacity != peers + b->max_local_streams ||
+        b->engine_capacity != b->api_capacity + p->client ||
+        b->native_capacity != b->engine_capacity + 3 ||
+        !wtq_conn_stream_storage_v2(b->engine_capacity, peers, &engine_bytes) ||
+        engine_bytes != p->engine_bytes ||
+        !wtq_capacity_mul(b->api_capacity, sizeof(struct wtq_stream), &api_bytes) ||
+        api_bytes != p->api_bytes ||
+        !wtq_capacity_add(engine_bytes, api_bytes, &total) ||
+        !wtq_capacity_add(total, p->native_bytes, &total) ||
+        !wtq_capacity_add(total, p->scratch_bytes, &total) ||
+        b->capacity_bytes != total) return WTQ_ERR_INVALID_ARG;
+    if (!ops->service || !ops->lease || !cfg->ops || !cfg->ops->recv_enable ||
+        !(cfg->ops->caps & WTQ_DCAP_RECV_FLOW_CONTROLLED)) return WTQ_ERR_UNSUPPORTED;
+    wtq_result_t rc = session_create(cfg, p, out);
+    if (rc != WTQ_OK) return rc;
+    wtq_session_t *s = *out;
+    s->admission_driver = cfg->drv;
+    s->admission_ops = (wtq_api_admission_ops_t){
+        .peer_uni = b->peer_unidi_stream_count, .peer_bidi = b->peer_bidi_stream_count,
+        .service = ops->service, .lease = ops->lease };
+    s->native_budget = ops->native_budget;
+    s->receive_quantum = 65535;
+    s->receive_mode = WTQ_RECEIVE_PAUSE_FLOW_CONTROLLED;
     return WTQ_OK;
 }
 
@@ -911,8 +1050,9 @@ bool wtq_api_session_admission_root(const wtq_session_t *s)
 void wtq_api_session_admission_detach(wtq_session_t *s)
 {
     if (!s) return;
+    stream_budget_freeze(s);
     s->admission_driver = NULL;
-    for (size_t i = 0; i < WTQ_API_MAX_STREAMS; ++i)
+    for (size_t i = 0; i < s->stream_capacity; ++i)
         s->streams[i].credit_stream = NULL;
 }
 
@@ -920,11 +1060,36 @@ wtq_result_t wtq_api_session_admit(wtq_session_t *s, wtq_peer_admission_t *peer)
 {
     if (!s || !peer) return WTQ_ERR_INVALID_ARG;
     if (!s->admission_running) return WTQ_ERR_STATE;
-    for (size_t i = 0; i < WTQ_API_MAX_STREAMS; ++i) {
+    if (s->budgeted) return WTQ_ERR_INVALID_ARG;
+    for (size_t i = 0; i < s->stream_capacity; ++i) {
         if (s->streams[i].refs == 0)
             return wtq_conn_peer_admit(s->conn, peer);
     }
     return WTQ_ERR_WOULD_BLOCK;
+}
+
+wtq_result_t wtq_api_session_admit_v2(wtq_session_t *s, wtq_peer_admission_v2_t *peer)
+{
+    if (!s || !s->budgeted || !peer || peer->struct_size < sizeof(*peer) ||
+        peer->reservation >= s->budget.peer_unidi_stream_count +
+            s->budget.peer_bidi_stream_count) return WTQ_ERR_INVALID_ARG;
+    if (!s->admission_running) return WTQ_ERR_STATE;
+    if (s->streams[peer->reservation].refs) return WTQ_ERR_STATE;
+    return wtq_conn_peer_admit(s->conn, &peer->prefix);
+}
+
+wtq_result_t wtq_session_stream_budget(const wtq_session_t *s, wtq_stream_budget_t *out)
+{
+    if (!s || !out || out->struct_size < WTQ_STREAM_BUDGET_V1_SIZE)
+        return WTQ_ERR_INVALID_ARG;
+    if (!s->budgeted) return WTQ_ERR_UNSUPPORTED;
+    wtq_stream_budget_t value;
+    stream_budget_snapshot(s, &value);
+    uint32_t caller_size = out->struct_size;
+    value.struct_size = caller_size;
+    size_t n = caller_size < sizeof(value) ? caller_size : sizeof(value);
+    memcpy(out, &value, n);
+    return WTQ_OK;
 }
 
 wtq_result_t wtq_session_service_stream_admission(wtq_session_t *s)
@@ -1176,6 +1341,7 @@ static wtq_result_t session_open(wtq_session_t *s, bool bidi,
     if (s->admission_driver != NULL) {
         reserved = stream_acquire(s, NULL, bidi, true, WTQ_STREAM_ID_UNKNOWN);
         if (!reserved) {
+            if (s->budgeted) wtq_counter_increment(&s->budget.local_open_blocked);
             session_exit(s);
             return WTQ_ERR_WOULD_BLOCK;
         }
@@ -1185,6 +1351,8 @@ static wtq_result_t session_open(wtq_session_t *s, bool bidi,
                            : wtq_conn_wt_open_uni(s->conn, &es);
     if (rc != WTQ_OK) {
         if (reserved) stream_slot_release(reserved);
+        if (s->budgeted && rc == WTQ_ERR_WOULD_BLOCK)
+            wtq_counter_increment(&s->budget.local_open_blocked);
         bool terminal = s->terminal_fired;
         session_exit(s);
         return rc == WTQ_ERR_STATE && terminal ? WTQ_ERR_CLOSED
