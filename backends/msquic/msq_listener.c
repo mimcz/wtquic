@@ -516,9 +516,9 @@ wtq_result_t wtq_msquic_listener_start(wtq_msquic_env_t *env,
         return rc;
     }
 
-    /* server Configuration: ALPN h3, tuning-derived settings, cert */
+    /* server Configuration: ALPN h3, the environment's settings, cert */
     QUIC_SETTINGS qs;
-    wtq_msq_settings_init(&qs, &env->tuning);
+    wtq_msq_env_settings_init(&qs, env);
     QUIC_BUFFER alpn = { 2, (uint8_t *)"h3" };
     if (QUIC_FAILED(env->api->ConfigurationOpen(
             env->registration, &alpn, 1, &qs, sizeof(qs), NULL,

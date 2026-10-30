@@ -285,6 +285,16 @@ if(WTQ_MSQUIC_ENABLED)
     add_test(NAME msquic_env COMMAND test_msquic_env)
     set_tests_properties(msquic_env PROPERTIES LABELS msquic)
 
+    # Environment keepalive at the actual ConfigurationOpen of both paths,
+    # through a borrowed fake API table (public API only).
+    add_executable(test_msquic_keepalive msquic/msquic_keepalive.c)
+    target_link_libraries(test_msquic_keepalive PRIVATE wtq::msquic)
+    target_include_directories(test_msquic_keepalive PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit)
+    target_compile_options(test_msquic_keepalive PRIVATE ${WTQ_WARN_FLAGS})
+    add_test(NAME msquic_keepalive COMMAND test_msquic_keepalive)
+    set_tests_properties(msquic_keepalive PROPERTIES LABELS msquic)
+
     # White-box driver-op edge cases (compiles the backend sources
     # directly — the ops are not part of any library's public surface).
     add_executable(test_msquic_ops
@@ -350,6 +360,17 @@ if(WTQ_MSQUIC_ENABLED)
         ${CMAKE_CURRENT_BINARY_DIR}/certs)
     set_tests_properties(local_flush_native PROPERTIES
         FIXTURES_REQUIRED certs LABELS "msquic;loopback" TIMEOUT 90)
+    # Bounded loopback: the keepalive the provider applied to both connections.
+    add_executable(test_keepalive_native msquic/keepalive_native.c)
+    target_include_directories(test_keepalive_native PRIVATE
+        ../src ../backends/msquic unit)
+    target_compile_options(test_keepalive_native PRIVATE ${WTQ_WARN_FLAGS})
+    target_link_libraries(test_keepalive_native PRIVATE
+        wtq::msquic msquic::msquic Threads::Threads)
+    add_test(NAME keepalive_native COMMAND test_keepalive_native
+        ${CMAKE_CURRENT_BINARY_DIR}/certs)
+    set_tests_properties(keepalive_native PROPERTIES
+        FIXTURES_REQUIRED certs LABELS "msquic;loopback" TIMEOUT 60)
     add_test(NAME msquic_send_commit_dispatch COMMAND test_msquic_ops --send-commit)
     set_tests_properties(msquic_send_commit_dispatch PROPERTIES LABELS msquic TIMEOUT 30)
     add_executable(test_send_commit_native msquic/send_commit_native.c)

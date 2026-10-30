@@ -35,12 +35,29 @@ void wtq_msquic_tuning_init(wtq_msquic_tuning_t *tuning)
         *tuning = def;
 }
 
-void wtq_msquic_env_cfg_init(wtq_msquic_env_cfg_t *cfg)
+void wtq_msquic_env_cfg_init_ex(wtq_msquic_env_cfg_t *cfg,
+                                size_t struct_size)
 {
     static const wtq_msquic_env_cfg_t def = WTQ_MSQUIC_ENV_CFG_INIT;
+    size_t n = struct_size < sizeof(def) ? struct_size : sizeof(def);
 
-    if (cfg != NULL)
-        *cfg = def;
+    /* Nothing is written unless struct_size itself fits, so the size recorded
+     * always describes exactly the bytes initialised. */
+    if (cfg == NULL || n < sizeof(cfg->struct_size))
+        return;
+    memcpy(cfg, &def, n);
+    cfg->struct_size = (uint32_t)n;
+}
+
+/* ABI-frozen entry: initialises ONLY the layout before keep_alive_interval_ms
+ * (the v1 object, its tail padding included), so an old binary that linked
+ * this symbol is never written past its object and its config leaves
+ * keepalive absent. New source reaches the current-size path through the
+ * header macro (-> _ex with the current type size). */
+#undef wtq_msquic_env_cfg_init
+void wtq_msquic_env_cfg_init(wtq_msquic_env_cfg_t *cfg)
+{
+    wtq_msquic_env_cfg_init_ex(cfg, sizeof(wtq_msquic_env_cfg_v1_t));
 }
 
 /* Release every owned resource and free the object. Safe on a partially
@@ -211,6 +228,12 @@ wtq_result_t wtq_msquic_env_open(const wtq_msquic_env_cfg_t *cfg_in,
     if (!wtq_stream_counts_valid(cfg.tuning.peer_unidi_stream_count,
             cfg.tuning.peer_bidi_stream_count, 16))
         return WTQ_ERR_INVALID_ARG;
+    /* Keepalive is present only when struct_size covers the whole field; a
+     * partial one is absent, never a partially copied value. Presence comes
+     * from the size alone, so a supplied 0 still counts. */
+    bool keep_alive_set = wtq_cfg_has(cfg_in->struct_size,
+        offsetof(wtq_msquic_env_cfg_t, keep_alive_interval_ms),
+        sizeof(cfg.keep_alive_interval_ms));
 
     alloc = (cfg.alloc != NULL) ? *cfg.alloc : *wtq_alloc_default();
 
@@ -229,6 +252,9 @@ wtq_result_t wtq_msquic_env_open(const wtq_msquic_env_cfg_t *cfg_in,
         return WTQ_ERR_BACKEND;
     }
     env->tuning = cfg.tuning;
+    env->keep_alive_set = keep_alive_set;
+    env->keep_alive_interval_ms =
+        keep_alive_set ? cfg.keep_alive_interval_ms : 0;
 
     /* API table: borrow the caller's or open our own. */
     if (cfg.existing_api != NULL) {

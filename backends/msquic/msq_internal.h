@@ -202,6 +202,27 @@ typedef struct wtq_msquic_listener_cfg_v4 {
     wtq_webtransport_profile_set_t webtransport_profiles;
 } wtq_msquic_listener_cfg_v4_t;
 
+/* FROZEN v1 environment config: the struct as it stood when tuning was its
+ * last field, i.e. what a caller compiled before keep_alive_interval_ms
+ * passes (including the old LP64 tail padding). The bare env_cfg_init symbol
+ * writes sizeof(this), and the ABI tests allocate exactly this size. */
+typedef struct wtq_msquic_env_cfg_v1 {
+    uint32_t struct_size;
+    const wtq_alloc_t *alloc;
+    const QUIC_API_TABLE *existing_api;
+    HQUIC existing_registration;
+    const char *app_name;
+    wtq_msquic_tuning_t tuning;
+} wtq_msquic_env_cfg_v1_t;
+
+_Static_assert(offsetof(wtq_msquic_env_cfg_t, _reserved_keep_alive) ==
+                   offsetof(wtq_msquic_env_cfg_v1_t, tuning) +
+                       sizeof(wtq_msquic_tuning_t),
+               "the reserved slot follows tuning directly");
+_Static_assert(offsetof(wtq_msquic_env_cfg_t, keep_alive_interval_ms) >=
+                   sizeof(wtq_msquic_env_cfg_v1_t),
+               "keep_alive_interval_ms overlaps the old env cfg's padding");
+
 /* Complete layouts immediately before stream-budget configuration. */
 typedef struct wtq_msquic_client_cfg_v2 {
     uint32_t struct_size;
@@ -432,6 +453,10 @@ struct wtq_msquic_env {
     char *app_name;          /* owned copy passed to RegistrationOpen */
     size_t app_name_size;    /* allocation size, for sized free */
     wtq_msquic_tuning_t tuning;
+    /* The config's keep_alive_interval_ms, and whether its struct_size
+     * covered the field: an absent one leaves the setting to MsQuic. */
+    bool keep_alive_set;
+    uint32_t keep_alive_interval_ms;
 
     /* Child tracking for the blocking close contract. mu guards the
      * lists, counts and the closing latch — held only for O(1)-ish
@@ -819,6 +844,10 @@ struct wtq_msquic_listener {
 /* msq_settings.c — tuning to QUIC_SETTINGS (values + IsSet bits). */
 void wtq_msq_settings_init(QUIC_SETTINGS *qs,
                            const wtq_msquic_tuning_t *tuning);
+/* The settings every ConfigurationOpen under env passes: the tuning
+ * translation plus the environment's keepalive, when it has one. */
+void wtq_msq_env_settings_init(QUIC_SETTINGS *qs,
+                               const struct wtq_msquic_env *env);
 
 /* msq_env.c — child tracking (all take env->mu internally).
  * conn_register returns false when the environment is closing (the

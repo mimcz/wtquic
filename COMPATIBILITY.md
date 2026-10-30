@@ -1,5 +1,31 @@
 # Compatibility note
 
+## Environment keepalive (unreleased)
+
+`wtq_msquic_env_cfg_t` appends `keep_alive_interval_ms` (milliseconds) after a
+never-read `_reserved_keep_alive` slot. The slot covers the tail padding the
+layout through `tuning` leaves on LP64, so the field lies past that layout's
+`sizeof` (72 bytes on LP64, 48 on ILP32) on every target.
+`wtq_msquic_tuning_t`, its initializer and its macro are unchanged.
+
+The value applies to every connection under the environment, client connects
+and accepted server connections alike, as MsQuic's `KeepAliveIntervalMs` (RFC
+9000 Section 10.1.2). Presence comes from `struct_size` alone:
+
+- covered: wtquic passes the value with its `IsSet` bit, so 0 explicitly
+  disables keepalive. `WTQ_MSQUIC_ENV_CFG_INIT` and the
+  `wtq_msquic_env_cfg_init` macro set 0.
+- absent or partially covered: the `IsSet` bit stays clear, as before, so the
+  process's or Registration's MsQuic setting applies (normally disabled).
+
+Every value is accepted. An interval at or above the connection's effective
+idle timeout cannot keep it alive.
+
+The bare `wtq_msquic_env_cfg_init` symbol is frozen to the old layout, so an
+older binary is never written past its object and keeps keepalive absent.
+Current source reaches the additive `wtq_msquic_env_cfg_init_ex` through the
+same-name macro. The Network.framework backend has no such setting.
+
 ## Passive local reliable flush (unreleased)
 
 `wtq_session_local_flush_mode` qualifies the evidence available to
@@ -103,8 +129,8 @@ counts fail `wtq_msquic_env_open` and are never clamped). The appended
 `max_local_streams` (L) on `wtq_msquic_client_cfg_t` and
 `wtq_msquic_listener_cfg_t` bounds combined local WT uni/bidi reservations
 per connection; zero, absent or partially covered selects 16, explicit
-1..1024. The bare initializer symbols keep their old write extents; the tuning
-and environment layouts do not change.
+1..1024. The bare initializer symbols keep their old write extents, and the
+stream plan leaves the tuning and environment layouts unchanged.
 
 Each connection preallocates, before client ConnectionStart or server
 acceptance: P=U+B resident peer records, each with its own classifier, engine

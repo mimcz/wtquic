@@ -136,6 +136,7 @@ WTQ_API void wtq_msquic_tuning_init(wtq_msquic_tuning_t *tuning);
  *   - app_name: optional label for an owned Registration (ignored when a
  *     Registration is borrowed). Copied during the call.
  *   - tuning: performance posture; see wtq_msquic_tuning_t.
+ *   - keep_alive_interval_ms: QUIC keepalive; see the field.
  *
  * Use WTQ_MSQUIC_ENV_CFG_INIT / wtq_msquic_env_cfg_init.
  */
@@ -146,13 +147,55 @@ typedef struct wtq_msquic_env_cfg {
     HQUIC existing_registration;
     const char *app_name;
     wtq_msquic_tuning_t tuning;
+    /* v2 (struct_size-gated). Reserved: covers the tail padding the layout
+     * through tuning leaves on LP64 targets, so keep_alive_interval_ms is
+     * gated past that old sizeof on every target. Never read. */
+    uint32_t _reserved_keep_alive;
+    /* QUIC keepalive for every connection under this environment, client
+     * connects and accepted server connections alike: MsQuic sends a PING
+     * once a connection has been idle this many milliseconds
+     * (QUIC_SETTINGS.KeepAliveIntervalMs; RFC 9000 Section 10.1.2). Every
+     * value is accepted, and is copied when the environment opens.
+     *
+     *   covered — struct_size includes the whole field: the value is passed
+     *     to MsQuic as set, so 0 explicitly DISABLES keepalive. The current
+     *     initializers default it to 0.
+     *   absent or partial — keepalive is left unset, so MsQuic's own setting
+     *     applies (the process's or Registration's, normally disabled). This
+     *     is what an older caller gets, unchanged.
+     *
+     * An interval at or above the connection's effective idle timeout cannot
+     * keep it alive. */
+    uint32_t keep_alive_interval_ms;
 } wtq_msquic_env_cfg_t;
 
 #define WTQ_MSQUIC_ENV_CFG_INIT                                  \
     { (uint32_t)sizeof(wtq_msquic_env_cfg_t), NULL, NULL, NULL,  \
-      NULL, WTQ_MSQUIC_TUNING_INIT }
+      NULL, WTQ_MSQUIC_TUNING_INIT, 0, 0 }
 
+/*
+ * Initialise an environment config. Same ABI rule as the client and listener
+ * configs below:
+ *   - wtq_msquic_env_cfg_init(cfg): the macro forwards the CONCRETE type size
+ *     (sizeof(wtq_msquic_env_cfg_t)), so a caller gets a config fully
+ *     initialised for the version it compiled against, keep_alive_interval_ms
+ *     included (0, explicitly disabled) — and cfg_init(NULL) stays a
+ *     compiling no-op.
+ *   - wtq_msquic_env_cfg_init_ex(cfg, struct_size): initialises exactly
+ *     struct_size bytes (clamped to what this library knows) and records that
+ *     size. A struct_size too small to hold struct_size itself writes nothing.
+ * The bare symbol is FROZEN to the layout before keep_alive_interval_ms, so an
+ * old binary that linked it is never written past its smaller object, and its
+ * config leaves keepalive absent. &wtq_msquic_env_cfg_init is that frozen
+ * initialiser; use &wtq_msquic_env_cfg_init_ex for a current-size function
+ * pointer.
+ */
 WTQ_API void wtq_msquic_env_cfg_init(wtq_msquic_env_cfg_t *cfg);
+WTQ_API void wtq_msquic_env_cfg_init_ex(wtq_msquic_env_cfg_t *cfg,
+                                        size_t struct_size);
+/* Concrete type size so cfg_init(NULL) still compiles and stays a no-op. */
+#define wtq_msquic_env_cfg_init(cfg) \
+    wtq_msquic_env_cfg_init_ex((cfg), sizeof(wtq_msquic_env_cfg_t))
 
 /*
  * Open an environment. On success *env_out owns whatever the config did

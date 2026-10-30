@@ -25,9 +25,16 @@ int main(void)
     void (*linit)(wtq_msquic_listener_cfg_t *) = wtq_msquic_listener_cfg_init;
     void (*linit_ex)(wtq_msquic_listener_cfg_t *, size_t) =
         wtq_msquic_listener_cfg_init_ex;
+    void (*einit)(wtq_msquic_env_cfg_t *) = wtq_msquic_env_cfg_init;
+    void (*einit_ex)(wtq_msquic_env_cfg_t *, size_t) =
+        wtq_msquic_env_cfg_init_ex;
 
     wtq_msquic_tuning_init(&tuning);
     wtq_msquic_env_cfg_init(&cfg);
+    wtq_msquic_env_cfg_init(NULL);
+    /* The current initialiser covers keepalive with 0 (explicitly off). */
+    if (cfg.keep_alive_interval_ms != 0) return 1;
+    cfg.keep_alive_interval_ms = 15000;
     /* The init macro uses the concrete type size, so a source caller always
      * gets a config sized for its compiled version AND cfg_init(NULL) is a
      * compiling no-op under pedantic C. */
@@ -54,6 +61,7 @@ int main(void)
     (void)open_fn;
     (void)close_fn;
     (void)cinit; (void)cinit_ex; (void)linit; (void)linit_ex;
+    (void)einit; (void)einit_ex;
     if (cfg.struct_size != sizeof(cfg))
         return 1;
     if (tuning.struct_size != sizeof(tuning))

@@ -1,6 +1,9 @@
 /*
  * Tuning to QUIC_SETTINGS translation. MsQuic applies a settings field
- * only when its IsSet bit is on, so every mapped field sets both.
+ * only when its IsSet bit is on, so every mapped field sets both. The one
+ * optional field, keepalive, sets both only when the environment's config
+ * supplied it; otherwise its bit stays clear and MsQuic's own setting
+ * applies.
  */
 
 #include <string.h>
@@ -44,4 +47,15 @@ void wtq_msq_settings_init(QUIC_SETTINGS *qs,
     qs->IsSet.DatagramReceiveEnabled = TRUE;
     qs->IdleTimeoutMs = t.idle_timeout_ms;
     qs->IsSet.IdleTimeoutMs = TRUE;
+}
+
+void wtq_msq_env_settings_init(QUIC_SETTINGS *qs,
+                               const struct wtq_msquic_env *env)
+{
+    wtq_msq_settings_init(qs, &env->tuning);
+    if (env->keep_alive_set) {
+        /* 0 included: a supplied 0 disables keepalive explicitly. */
+        qs->KeepAliveIntervalMs = env->keep_alive_interval_ms;
+        qs->IsSet.KeepAliveIntervalMs = TRUE;
+    }
 }

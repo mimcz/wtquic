@@ -368,8 +368,8 @@ wtq_result_t wtq_msq_session_create_bounded(struct wtq_driver *drv,
     rc = wtq_api_session_create_admission_v2(cfg, &ops, out);
     if (rc != WTQ_OK) goto fail;
     drv->bounded_admission = true;
-    /* Exactly the settings translation passed to ConfigurationOpen on both
-     * client and listener paths. Buffered buffer-return cannot certify ACKs
+    /* The same tuning translation ConfigurationOpen receives on both client
+     * and listener paths. Buffered buffer-return cannot certify ACKs
      * for an open stream (MsQuic docs/Streams.md, Send Buffering). */
     if (settings.IsSet.SendBufferingEnabled && !settings.SendBufferingEnabled) {
         rc = wtq_api_session_set_local_flush(*out, WTQ_LOCAL_FLUSH_ACKNOWLEDGED,

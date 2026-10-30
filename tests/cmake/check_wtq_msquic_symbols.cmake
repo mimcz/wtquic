@@ -17,6 +17,7 @@ endif()
 set(ALLOWED_SYMBOLS
     wtq_msquic_tuning_init
     wtq_msquic_env_cfg_init
+    wtq_msquic_env_cfg_init_ex
     wtq_msquic_env_open
     wtq_msquic_env_close
     wtq_msquic_listener_cfg_init

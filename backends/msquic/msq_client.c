@@ -114,9 +114,9 @@ wtq_result_t wtq_msquic_client_connect(wtq_msquic_env_t *env,
     drv->on_transport_quiesced = cfg.on_transport_quiesced;
     drv->quiesced_user = cfg.user;
 
-    /* client Configuration: ALPN h3, tuning-derived settings, creds */
+    /* client Configuration: ALPN h3, the environment's settings, creds */
     QUIC_SETTINGS qs;
-    wtq_msq_settings_init(&qs, &env->tuning);
+    wtq_msq_env_settings_init(&qs, env);
     QUIC_BUFFER alpn = { 2, (uint8_t *)"h3" };
     HQUIC config = NULL;
     if (QUIC_FAILED(env->api->ConfigurationOpen(

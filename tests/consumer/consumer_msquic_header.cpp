@@ -21,9 +21,16 @@ int main()
     void (*linit)(wtq_msquic_listener_cfg_t *) = wtq_msquic_listener_cfg_init;
     void (*linit_ex)(wtq_msquic_listener_cfg_t *, size_t) =
         wtq_msquic_listener_cfg_init_ex;
+    void (*einit)(wtq_msquic_env_cfg_t *) = wtq_msquic_env_cfg_init;
+    void (*einit_ex)(wtq_msquic_env_cfg_t *, size_t) =
+        wtq_msquic_env_cfg_init_ex;
 
     wtq_msquic_tuning_init(&tuning);
     wtq_msquic_env_cfg_init(&cfg);
+    wtq_msquic_env_cfg_init(nullptr);
+    /* The current initialiser covers keepalive with 0 (explicitly off). */
+    if (cfg.keep_alive_interval_ms != 0) return 1;
+    cfg.keep_alive_interval_ms = 15000;
     /* The init macro must expand cleanly under C++17, including cfg_init(NULL). */
     wtq_msquic_client_cfg_init(&ccfg);
     wtq_msquic_listener_cfg_init(&lcfg);
@@ -55,6 +62,7 @@ int main()
     (void)open_fn;
     (void)close_fn;
     (void)cinit; (void)cinit_ex; (void)linit; (void)linit_ex;
+    (void)einit; (void)einit_ex;
     lcfg.webtransport_profiles = WTQ_WEBTRANSPORT_PROFILES_ALL;
     if (lcfg.webtransport_profiles != WTQ_WEBTRANSPORT_PROFILES_ALL)
         return 1;
